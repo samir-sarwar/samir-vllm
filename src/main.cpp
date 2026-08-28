@@ -3,57 +3,39 @@
 #include <cstdlib>
 #include <queue>
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
-#include "json.hpp"
+#include <nlohmann/json.hpp> // grabs json header for functions to parse and create json objects in cpp
 
-using json = nlohmann::json;
+#define B_TO_GB 1024*1024*1024
+
+using json = nlohmann::json; // local alias 
 
 #include <iostream>
 
-#include "kernels.cuh"
-namespace
-{
+#include "kernels.cuh" // we can run the functions from kernel.cuh
+// they were implemented in kernels.cu 
 
-    void checkCuda(cudaError_t result, const char *action)
-    {
-        if (result == cudaSuccess)
-        {
-            return;
-        }
+int checkGPUStatus(){
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count); // cuda func to get device count
+    if (device_count == 0){
+        std::cerr << "no cuda devices found \n"; //cout but for errors 
+        return 1;
 
-        std::cerr << "CUDA error while " << action << ": "
-                  << cudaGetErrorString(result) << '\n';
-        std::exit(EXIT_FAILURE);
     }
-
-    void printGpuInfo()
-    {
-        int deviceCount = 0;
-        checkCuda(cudaGetDeviceCount(&deviceCount), "checking for CUDA devices");
-
-        if (deviceCount == 0)
-        {
-            std::cerr << "No CUDA-capable GPU was found.\n";
-            std::exit(EXIT_FAILURE);
-        }
-
-        cudaDeviceProp device{};
-        checkCuda(cudaGetDeviceProperties(&device, 0), "reading GPU properties");
-
-        std::cout << "GPU: " << device.name << '\n'
-                  << "Compute capability: " << device.major << '.' << device.minor << '\n'
-                  << "Global memory: " << (device.totalGlobalMem / (1024 * 1024)) << " MiB\n";
-    }
-
-} // namespace
-
+    cudaDeviceProp prop; // creates struct to hold info on gpu
+    cudaGetDeviceProperties(&prop,0); // fill struct
+    std::cout << "Device: " << prop.name << "\n";
+    std::cout << "SM count: " << prop.multiProcessorCount << "\n";
+    std::cout << "Max threads per block: " << prop.maxThreadsPerBlock << std::endl;
+    size_t free_mem;
+    size_t total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    std::cout << "Free memory: " << (free_mem / (1024*1024*1024)) << "GB, total memory: " << total_mem / (1024*1024*1024) << "GB\n";
+    return 0;
+}
 int main()
 {
-    printGpuInfo();
+    checkGPUStatus();
 
-    warmUpGpu();
-    checkCuda(cudaGetLastError(), "launching the warm-up kernel");
-    checkCuda(cudaDeviceSynchronize(), "waiting for the warm-up kernel");
-
-    std::cout << "CUDA setup is ready.\n";
-    return EXIT_SUCCESS;
+    return 0;
 }
