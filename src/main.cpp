@@ -5,7 +5,9 @@
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
 #include <nlohmann/json.hpp> // grabs json header for functions to parse and create json objects in cpp
 #include <fstream>
-#define B_TO_GB 1024*1024*1024
+#include <unordered_map>
+#include <algorithm>
+#include <vector>
 
 using json = nlohmann::json; // local alias 
 
@@ -37,29 +39,105 @@ int checkGPUStatus(){
 void loadModelHeader(){
     std::string path = "models/llama-3.2-1b-instruct/model.safetensors"; // set local path
     std::ifstream safetensors_file(path, std::ios::binary); // open file as binary file
-    if(!safetensors_file){
-        std::cerr << "could not open safetensors file";
-        return -1;
-    }
+    // if(!safetensors_file){
+    //     std::cerr << "could not open safetensors file";
+    //     return -1;
+    // }
     uint64_t headersize = 0;
     // so read expects a char buffer to store the extracted data
     // so we cast it to tell cpp to treat this variables memory as an 8-byte 
     // destination buffer, we know its size is 8 bytes, but we can also use sizeof
     safetensors_file.read(reinterpret_cast<char*>(&headersize),8);
-    if(!safetensors_file){
-        std::cerr << "could not read safetensors file";
-        return -1;
-    }
+    // if(!safetensors_file){
+    //     std::cerr << "could not read safetensors file";
+    //     std::exit();
+    // }
     std::cout << headersize << '\n';
     // this means the next headersize amount of bytes of the file contain the json header which
-    // describes all tensors. What we want to do now is allocate this amount of memory on the GPU 
-    // then create pointers to each of the tensors, using the offsets from shape value for each tensor
+    // describes all tensors. What we want to do now create pointers to each of the tensors, using the offsets from shape value for each tensor 
+    // then allocate headersize amount of memory on the GPU 
+    // oh shi a tensor is also called a layer makes sense
+    std::string header(headersize, '\0' ); // string of headersize init with null char
+    // header.data points to strings actual character buffer
+    safetensors_file.read(header.data(),headersize);
+    // convert this bigass string into a json object
+    json header_json = json::parse(header);
+
     
+
+    // the way we are going to store tensor -> starting byte offset is going to be using
+    // a hashmap
+
+    std::unordered_map<std::string, uint64_t> offsets;
+    // at some point we need know the largest tensor end offset in the raw tensor data
+    // bytes as that will tell us how much memory we need to actually allocate as
+    // we end up copying the ENTIRE raw tensordata from model file to our gpu. 
+    
+    uint64_t max_offset = 0;
+    // read only, access key and value from pair from JSON header 
+    for(const auto& [name,tensor_info] : header_json.items()){
+        if(name == "__metadata__"){
+            continue;
+        }
+        // you can read how they structured the json object from when we printed the entire header
+        // will help us with parsing
+        const auto& data_offsets = tensor_info.at("data_offsets");
+        // we want to convert it to a 64 bit integer as its still a JSON value 
+        uint64_t start_offset = data_offsets.at(0).get<uint64_t>();
+        uint64_t end_offset = data_offsets.at(1).get<uint64_t>();
+        // add to hashmap, effeciently constructs it in place inside map memory 
+        // avoiding temporary memory.
+        offsets.emplace(name, start_offset);
+        max_offset = std::max(max_offset,end_offset);
+
+        // test
+        std::cout << name << " starts at: " << start_offset 
+        << " ends at: " << end_offset << "\n";
+        std::cout << "we have to allocate this many bytes: " << (end_offset / 8) << '\n';
+    }
+    // now we have to read the raw tensor data copy it to memory so we can then copy it to the gpu
+    // remember our file ptr which points to start of where we read from is now at the start
+    // of our tensor data as it started from 0, read specifically size of header
+    // then read specifically size of json header. Meaning its now at raw data. 
+    std::vector<char> model_weights_cpu(max_offset);
+    // model_weights_cpu.data() gets the addr of 1st bytes like &array[0]
+    safetensors_file.read(model_weights_cpu.data(),
+                        static_cast<std::streamsize>(max_offset));
+
+    // just give cuda a nullptr and the size of buffer and we can return the starting address
+    // of the buffer with size given
+    void* model_weights_gpu = nullptr;
+    cudaMalloc(&model_weights_gpu,max_offset);
+    // now we can copy from cpu memory to gpu memory. 
+
+    cudaMemcpy(model_weights_gpu, model_weights_cpu.data(),model_weights_cpu.size(),cudaMemcpyHostToDevice);
+
+    // must revisit this
+    std::unordered_map<std::string, __nv_bfloat16*> tensor_pointers;
+
+    char* base = static_cast<char*>(model_weights_gpu);
+
+    for (const auto& [name, start_offset] : offsets) {
+        __nv_bfloat16* tensor_pointer =
+            reinterpret_cast<__nv_bfloat16*>(
+                base + start_offset
+            );
+
+        tensor_pointers.emplace(name, tensor_pointer);
+    }
+
+
+
+
+
+
+
+
 
 }
 int main()
 {
-    checkGPUStatus();
+    // checkGPUStatus();
     loadModelHeader();
 
 
