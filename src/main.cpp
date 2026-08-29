@@ -35,22 +35,22 @@ int checkGPUStatus(){
     std::cout << "Free memory: " << (free_mem / (1024*1024*1024)) << "GB, total memory: " << total_mem / (1024*1024*1024) << "GB\n";
     return 0;
 }
-constexpr int N_LAYERS = 16;
+constexpr int N_LAYERS = 16; // 16 transformer layers 
 
-struct Weights {
-    void* model_storage = nullptr;  // owns the one large GPU allocation
+struct LLamaWeights {
+    void* model_storage = nullptr;  // generic pointer to start of Gpu alloc
 
-    __nv_bfloat16* embed_tokens = nullptr;
-    __nv_bfloat16* norm = nullptr;
+    __nv_bfloat16* embed_tokens = nullptr; // ptr to embedding table, of bf16 vectors
+    __nv_bfloat16* norm = nullptr; // final rmsnorm weight vector 
 
-    __nv_bfloat16* input_layernorm[N_LAYERS]{};
-    __nv_bfloat16* post_attn_layernorms[N_LAYERS]{};
+    __nv_bfloat16* input_layernorm[N_LAYERS]{}; // array of 16 GPU pointers init to nullptr: input rmsnorm
+    __nv_bfloat16* post_attn_layernorms[N_LAYERS]{}; // rmsnorm weights after attention
 
-    __nv_bfloat16* w_q[N_LAYERS]{};
-    __nv_bfloat16* w_k[N_LAYERS]{};
-    __nv_bfloat16* w_v[N_LAYERS]{};
-    __nv_bfloat16* w_o[N_LAYERS]{};
-
+    __nv_bfloat16* w_q[N_LAYERS]{}; // query: what token is looking for
+    __nv_bfloat16* w_k[N_LAYERS]{}; // key: what each token can be matched on
+    __nv_bfloat16* w_v[N_LAYERS]{}; // value: the information each token contributes
+    __nv_bfloat16* w_o[N_LAYERS]{}; // output: combines attention result 
+    // small feed forward neural network inside each transformer layer 
     __nv_bfloat16* mlp_gate_proj[N_LAYERS]{};
     __nv_bfloat16* mlp_up_proj[N_LAYERS]{};
     __nv_bfloat16* mlp_down_proj[N_LAYERS]{};
@@ -131,7 +131,7 @@ int loadModel(Weights& weights){
     // now we can copy from cpu memory to gpu memory. 
 
     cudaMemcpy(model_weights_gpu, model_weights_cpu.data(),model_weights_cpu.size(),cudaMemcpyHostToDevice);
-
+    weights.model_storage = model_weights_gpu;
     // create a hashmap of names of tensors and pointers to them 
 
     /* 
@@ -149,6 +149,41 @@ int loadModel(Weights& weights){
     }
     */
 
+    char* base = static_cast<char*>(weights.model_storage);
+
+    weights.embed_tokens = reinterpret_cast<__nv_bfloat16*>(
+        base + offsets.at("model.embed_tokens.weight"));
+
+    weights.norm = reinterpret_cast<__nv_bfloat16*>(base + offsets.at("model.norm.weight"));
+    // must wire pointers to 2 rmsnorm vectors, four attention matricies and 3 mlp matricies
+    // so each of the 16 layers has 9 weight tensors
+    for (int layer = 0; layer < N_LAYERS; ++layer) {
+        std::string prefix = "model.layers." + std::to_string(layer);
+        weights.w_q[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".self_attn.q_proj.weight"));
+        weights.w_k[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".self_attn.k_proj.weight"));
+        weights.w_v[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".self_attn.v_proj.weight"));
+        weights.w_o[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".self_attn.o_proj.weight"));
+
+        weights.input_layernorm[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".input_layernorm.weight"));
+
+        weights.post_attn_layernorms[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".post_attention_layernorm.weight"));
+
+        weights.mlp_gate_proj[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".mlp.gate_proj.weight"));
+
+        weights.mlp_up_proj[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".mlp.up_proj.weight"));
+
+        weights.mlp_down_proj[layer] = reinterpret_cast<__nv_bfloat16*>(
+            base + offsets.at(prefix + ".mlp.down_proj.weight"));
+
+    }
 
 
 
@@ -166,7 +201,7 @@ int loadModel(Weights& weights){
 int main()
 {
     // checkGPUStatus();
-    loadModelHeader();
+    loadLLamaModel();
 
 
     return 0;
