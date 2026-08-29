@@ -1,31 +1,40 @@
-#include <cuda_runtime.h> // Cuda run time, allows us to do all our CUDA work.
-#include <cublas_v2.h>    // Allows us to do big matrix multiplictions
+// CUDA runtime: allows us to do all our CUDA work.
+#include <cuda_runtime.h>
+// Allows us to do big matrix multiplications.
+#include <cublas_v2.h>
 #include <cstdlib>
 #include <queue>
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
-#include <nlohmann/json.hpp> // grabs json header for functions to parse and create json objects in cpp
+// Grabs json header for functions to parse and create json objects in cpp.
+#include <nlohmann/json.hpp>
 #include <fstream>
 #include <unordered_map>
 #include <algorithm>
 #include <vector>
 
-using json = nlohmann::json; // local alias 
+// Local alias.
+using json = nlohmann::json;
 
 #include <iostream>
 
-#include "kernels.cuh" // we can run the functions from kernel.cuh
-// they were implemented in kernels.cu 
+// We can run the functions from kernels.cuh.
+// They were implemented in kernels.cu.
+#include "kernels.cuh"
 
 int checkGPUStatus(){
     int device_count = 0;
-    cudaGetDeviceCount(&device_count); // cuda func to get device count
+    // CUDA func to get device count.
+    cudaGetDeviceCount(&device_count);
     if (device_count == 0){
-        std::cerr << "no cuda devices found \n"; //cout but for errors 
+        // cout but for errors.
+        std::cerr << "no cuda devices found \n";
         return 1;
 
     }
-    cudaDeviceProp prop; // creates struct to hold info on gpu
-    cudaGetDeviceProperties(&prop,0); // fill struct
+    // Creates struct to hold info on gpu.
+    cudaDeviceProp prop;
+    // Fill struct.
+    cudaGetDeviceProperties(&prop,0);
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "SM count: " << prop.multiProcessorCount << "\n";
     std::cout << "Max threads per block: " << prop.maxThreadsPerBlock << std::endl;
@@ -35,110 +44,123 @@ int checkGPUStatus(){
     std::cout << "Free memory: " << (free_mem / (1024*1024*1024)) << "GB, total memory: " << total_mem / (1024*1024*1024) << "GB\n";
     return 0;
 }
-constexpr int N_LAYERS = 16; // 16 transformer layers 
+// 16 transformer layers.
+constexpr int N_LAYERS = 16;
 
 struct LLamaWeights {
-    void* model_storage = nullptr;  // generic pointer to start of Gpu alloc
+    // Generic pointer to start of gpu alloc.
+    void* model_storage = nullptr;
 
-    __nv_bfloat16* embed_tokens = nullptr; // ptr to embedding table, of bf16 vectors
-    __nv_bfloat16* norm = nullptr; // final rmsnorm weight vector 
+    // Ptr to embedding table, of bf16 vectors.
+    __nv_bfloat16* embed_tokens = nullptr;
+    // Final rmsnorm weight vector.
+    __nv_bfloat16* norm = nullptr;
 
-    __nv_bfloat16* input_layernorm[N_LAYERS]{}; // array of 16 GPU pointers init to nullptr: input rmsnorm
-    __nv_bfloat16* post_attn_layernorms[N_LAYERS]{}; // rmsnorm weights after attention
+    // Array of 16 GPU pointers init to nullptr: input rmsnorm.
+    __nv_bfloat16* input_layernorm[N_LAYERS]{};
+    // Rmsnorm weights after attention.
+    __nv_bfloat16* post_attn_layernorms[N_LAYERS]{};
 
-    __nv_bfloat16* w_q[N_LAYERS]{}; // query: what token is looking for
-    __nv_bfloat16* w_k[N_LAYERS]{}; // key: what each token can be matched on
-    __nv_bfloat16* w_v[N_LAYERS]{}; // value: the information each token contributes
-    __nv_bfloat16* w_o[N_LAYERS]{}; // output: combines attention result 
-    // small feed forward neural network inside each transformer layer 
+    // Query: what token is looking for.
+    __nv_bfloat16* w_q[N_LAYERS]{};
+    // Key: what each token can be matched on.
+    __nv_bfloat16* w_k[N_LAYERS]{};
+    // Value: the information each token contributes.
+    __nv_bfloat16* w_v[N_LAYERS]{};
+    // Output: combines attention result.
+    __nv_bfloat16* w_o[N_LAYERS]{};
+
+    // Small feed forward neural network inside each transformer layer.
     __nv_bfloat16* mlp_gate_proj[N_LAYERS]{};
     __nv_bfloat16* mlp_up_proj[N_LAYERS]{};
     __nv_bfloat16* mlp_down_proj[N_LAYERS]{};
 };
 
 int loadLlamaModel(LLamaWeights& weights){
-    std::string path = "models/llama-3.2-1b-instruct/model.safetensors"; // set local path
-    std::ifstream safetensors_file(path, std::ios::binary); // open file as binary file
+    // Set local path.
+    std::string path = "models/llama-3.2-1b-instruct/model.safetensors";
+    // Open file as binary file.
+    std::ifstream safetensors_file(path, std::ios::binary);
     if(!safetensors_file){
         std::cerr << "could not open safetensors file";
         return -1;
     }
     uint64_t headersize = 0;
-    // so read expects a char buffer to store the extracted data
-    // so we cast it to tell cpp to treat this variables memory as an 8-byte 
-    // destination buffer, we know its size is 8 bytes, but we can also use sizeof
+    // Read expects a char buffer to store the extracted data.
+    // We cast to tell cpp to treat this variable's memory as an 8-byte
+    // destination buffer. We know its size is 8 bytes, but we can also use sizeof.
     safetensors_file.read(reinterpret_cast<char*>(&headersize),8);
     if(!safetensors_file){
         std::cerr << "could not read safetensors file";
         return -1;
     }
     std::cout << headersize << '\n';
-    // this means the next headersize amount of bytes of the file contain the json header which
-    // describes all tensors. What we want to do now create pointers to each of the tensors, using the offsets from shape value for each tensor 
-    // then allocate headersize amount of memory on the GPU 
-    // oh shi a tensor is also called a layer makes sense
-    std::string header(headersize, '\0' ); // string of headersize init with null char
-    // header.data points to strings actual character buffer
+    // The next headersize bytes of the file contain the json header which
+    // describes all tensors. We use each tensor's data_offsets values to create
+    // pointers later, then allocate max_offset bytes of memory on the GPU.
+    // A tensor is not the same thing as a layer: each transformer layer contains
+    // multiple tensors.
+    // String of headersize init with null char.
+    std::string header(headersize, '\0' );
+    // header.data points to string's actual character buffer.
     safetensors_file.read(header.data(),headersize);
-    // convert this bigass string into a json object
+    // Convert this bigass string into a json object.
     json header_json = json::parse(header);
 
     
 
-    // the way we are going to store tensor -> starting byte offset is going to be using
-    // a hashmap
-
+    // The way we are going to store tensor -> starting byte offset is by using
+    // a hashmap.
     std::unordered_map<std::string, uint64_t> offsets;
-    // at some point we need know the largest tensor end offset in the raw tensor data
-    // bytes as that will tell us how much memory we need to actually allocate as
-    // we end up copying the ENTIRE raw tensordata from model file to our gpu. 
-    
+    // We need to know the largest tensor end offset in the raw tensor-data
+    // bytes, as that tells us how much memory we need to allocate when we copy
+    // the ENTIRE raw tensor data from the model file to our gpu.
     uint64_t max_offset = 0;
-    // read only, access key and value from pair from JSON header 
+    // Read-only: access key and value from pair from JSON header.
     for(const auto& [name,tensor_info] : header_json.items()){
         if(name == "__metadata__"){
             continue;
         }
-        // you can read how they structured the json object from when we printed the entire header
-        // will help us with parsing
+        // You can read how they structured the json object from when we printed
+        // the entire header. It will help us with parsing.
         const auto& data_offsets = tensor_info.at("data_offsets");
-        // we want to convert it to a 64 bit integer as its still a JSON value 
+        // We want to convert it to a 64 bit integer as it is still a JSON value.
         uint64_t start_offset = data_offsets.at(0).get<uint64_t>();
         uint64_t end_offset = data_offsets.at(1).get<uint64_t>();
-        // add to hashmap, effeciently constructs it in place inside map memory 
+        // Add to hashmap; effeciently constructs it in place inside map memory,
         // avoiding temporary memory.
         offsets.emplace(name, start_offset);
         max_offset = std::max(max_offset,end_offset);
 
-        // test
+        // Test.
         std::cout << name << " starts at: " << start_offset 
         << " ends at: " << end_offset << "\n";
         std::cout << "we have to allocate this many bytes: " << (end_offset / 8) << '\n';
     }
-    // now we have to read the raw tensor data copy it to memory so we can then copy it to the gpu
-    // remember our file ptr which points to start of where we read from is now at the start
-    // of our tensor data as it started from 0, read specifically size of header
-    // then read specifically size of json header. Meaning its now at raw data. 
+    // Now we have to read the raw tensor data, copy it to memory, and then copy
+    // it to the gpu. Our file ptr is now at the start of tensor data: it started
+    // at 0, read the header size, then read the json header.
     std::vector<char> model_weights_cpu(max_offset);
-    // model_weights_cpu.data() gets the addr of 1st bytes like &array[0]
+    // model_weights_cpu.data() gets the addr of 1st bytes like &array[0].
     safetensors_file.read(model_weights_cpu.data(),
                         static_cast<std::streamsize>(max_offset));
 
-    // just give cuda a nullptr and the size of buffer and we can return the starting address
-    // of the buffer with size given
+    // Just give cuda a nullptr and the size of buffer, and we can return the
+    // starting address of the buffer with size given.
     void* model_weights_gpu = nullptr;
     cudaMalloc(&model_weights_gpu,max_offset);
-    // now we can copy from cpu memory to gpu memory. 
+    // Now we can copy from cpu memory to gpu memory.
 
     cudaMemcpy(model_weights_gpu, model_weights_cpu.data(),model_weights_cpu.size(),cudaMemcpyHostToDevice);
     weights.model_storage = model_weights_gpu;
-    // create a hashmap of names of tensors and pointers to them 
+    // Create a hashmap of names of tensors and pointers to them.
 
     /* 
     std::unordered_map<std::string, __nv_bfloat16*> tensor_pointers;
-    // we cast as model weights gpu is a generic pointer to start of whole gpu buffer 
+    // We cast as model weights gpu is a generic pointer to start of whole gpu buffer.
     char* base = static_cast<char*>(model_weights_gpu);
-    // go through hashmap of offsets, so we can make a cpu lookup table to see where things are in the GPU
+    // Go through hashmap of offsets, so we can make a cpu lookup table to see
+    // where things are in the GPU.
     for (const auto& [name, start_offset] : offsets) {
         __nv_bfloat16* tensor_pointer =
             reinterpret_cast<__nv_bfloat16*>(
@@ -155,8 +177,8 @@ int loadLlamaModel(LLamaWeights& weights){
         base + offsets.at("model.embed_tokens.weight"));
 
     weights.norm = reinterpret_cast<__nv_bfloat16*>(base + offsets.at("model.norm.weight"));
-    // must wire pointers to 2 rmsnorm vectors, four attention matricies and 3 mlp matricies
-    // so each of the 16 layers has 9 weight tensors
+    // Must wire pointers to 2 rmsnorm vectors, four attention matrices, and 3
+    // mlp matrices, so each of the 16 layers has 9 weight tensors.
     for (int layer = 0; layer < N_LAYERS; ++layer) {
         std::string prefix = "model.layers." + std::to_string(layer);
         weights.w_q[layer] = reinterpret_cast<__nv_bfloat16*>(
