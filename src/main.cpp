@@ -214,7 +214,7 @@ int main()
     // checkGPUStatus();
     LLamaWeights weights{};
     if(loadLlamaModel(weights) !=0 ){
-        return -1
+        return -1;
     }
     
 
