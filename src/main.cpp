@@ -56,7 +56,7 @@ struct LLamaWeights {
     __nv_bfloat16* mlp_down_proj[N_LAYERS]{};
 };
 
-int loadModel(Weights& weights){
+int loadLlamaModel(LLamaWeights& weights){
     std::string path = "models/llama-3.2-1b-instruct/model.safetensors"; // set local path
     std::ifstream safetensors_file(path, std::ios::binary); // open file as binary file
     if(!safetensors_file){
@@ -184,24 +184,17 @@ int loadModel(Weights& weights){
             base + offsets.at(prefix + ".mlp.down_proj.weight"));
 
     }
-
-
-
-    
-
-
-
-
-
-
-
-
+    return 0;
 
 }
 int main()
 {
     // checkGPUStatus();
-    loadLLamaModel();
+    LLamaWeights weights{};
+    if(loadLlamaModel(weights) !=0 ){
+        return -1
+    }
+    
 
 
     return 0;
