@@ -35,23 +35,43 @@ int checkGPUStatus(){
     std::cout << "Free memory: " << (free_mem / (1024*1024*1024)) << "GB, total memory: " << total_mem / (1024*1024*1024) << "GB\n";
     return 0;
 }
+constexpr int N_LAYERS = 16;
 
-void loadModelHeader(){
+struct Weights {
+    void* model_storage = nullptr;  // owns the one large GPU allocation
+
+    __nv_bfloat16* embed_tokens = nullptr;
+    __nv_bfloat16* norm = nullptr;
+
+    __nv_bfloat16* input_layernorm[N_LAYERS]{};
+    __nv_bfloat16* post_attn_layernorms[N_LAYERS]{};
+
+    __nv_bfloat16* w_q[N_LAYERS]{};
+    __nv_bfloat16* w_k[N_LAYERS]{};
+    __nv_bfloat16* w_v[N_LAYERS]{};
+    __nv_bfloat16* w_o[N_LAYERS]{};
+
+    __nv_bfloat16* mlp_gate_proj[N_LAYERS]{};
+    __nv_bfloat16* mlp_up_proj[N_LAYERS]{};
+    __nv_bfloat16* mlp_down_proj[N_LAYERS]{};
+};
+
+int loadModel(Weights& weights){
     std::string path = "models/llama-3.2-1b-instruct/model.safetensors"; // set local path
     std::ifstream safetensors_file(path, std::ios::binary); // open file as binary file
-    // if(!safetensors_file){
-    //     std::cerr << "could not open safetensors file";
-    //     return -1;
-    // }
+    if(!safetensors_file){
+        std::cerr << "could not open safetensors file";
+        return -1;
+    }
     uint64_t headersize = 0;
     // so read expects a char buffer to store the extracted data
     // so we cast it to tell cpp to treat this variables memory as an 8-byte 
     // destination buffer, we know its size is 8 bytes, but we can also use sizeof
     safetensors_file.read(reinterpret_cast<char*>(&headersize),8);
-    // if(!safetensors_file){
-    //     std::cerr << "could not read safetensors file";
-    //     std::exit();
-    // }
+    if(!safetensors_file){
+        std::cerr << "could not read safetensors file";
+        return -1;
+    }
     std::cout << headersize << '\n';
     // this means the next headersize amount of bytes of the file contain the json header which
     // describes all tensors. What we want to do now create pointers to each of the tensors, using the offsets from shape value for each tensor 
@@ -112,11 +132,13 @@ void loadModelHeader(){
 
     cudaMemcpy(model_weights_gpu, model_weights_cpu.data(),model_weights_cpu.size(),cudaMemcpyHostToDevice);
 
-    // must revisit this
+    // create a hashmap of names of tensors and pointers to them 
+
+    /* 
     std::unordered_map<std::string, __nv_bfloat16*> tensor_pointers;
-
+    // we cast as model weights gpu is a generic pointer to start of whole gpu buffer 
     char* base = static_cast<char*>(model_weights_gpu);
-
+    // go through hashmap of offsets, so we can make a cpu lookup table to see where things are in the GPU
     for (const auto& [name, start_offset] : offsets) {
         __nv_bfloat16* tensor_pointer =
             reinterpret_cast<__nv_bfloat16*>(
@@ -125,6 +147,12 @@ void loadModelHeader(){
 
         tensor_pointers.emplace(name, tensor_pointer);
     }
+    */
+
+
+
+
+    
 
 
 
