@@ -2,3 +2,4 @@ build/
 model.safetensors
 __pycache__/
 *.pyc
+.DS_Store

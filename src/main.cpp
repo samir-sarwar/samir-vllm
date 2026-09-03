@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
+#include "tokenizer.hpp"
 
 // Local alias.
 using json = nlohmann::json;
@@ -358,12 +359,35 @@ int loadModelMmap(LLamaWeights &weights)
     return 0;
 }
 
+std::vector<int> tokenizePrompt(const std::string &prompt, const std::string &tokenizer_path)
+{
+    Tokenizer tokenizer;
+    std::string error;
+    tokenizer.load(tokenizer_path, &error);
+
+    std::vector<int> token_ids = tokenizer.encode(prompt);
+
+    return token_ids;
+}
 int main()
 {
     // checkGPUStatus();
     LLamaWeights weights{};
+    // temporarily using prompt as hello world, will be modified to take user input
+    const std::string prompt = "Hello World!";
+    const std::string tokenizer_path = "models/llama-3.2-1b-instruct/tokenizer.model";
     if (loadLlamaModel(weights) != 0)
     {
+        return -1;
+    }
+
+    Tokenizer tokenizer;
+    std::string tokenizer_error;
+
+    if (!tokenizer.load("models/llama-3.2-1b-instruct/tokenizer.model",
+                        &tokenizer_error))
+    {
+        std::cerr << tokenizer_error << '\n';
         return -1;
     }
 
