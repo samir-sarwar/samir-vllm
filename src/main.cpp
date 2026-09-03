@@ -11,6 +11,11 @@
 #include <unordered_map>
 #include <algorithm>
 #include <vector>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cstring>
 
 // Local alias.
 using json = nlohmann::json;
@@ -213,13 +218,153 @@ int loadLlamaModel(LLamaWeights &weights)
     }
     return 0;
 }
+
+// Spent abount 1hr 30min making the loader except using Mmap this time
+int loadModelMmap(LLamaWeights &weights)
+{
+    std::string path = "models/llama-3.2-1b-instruct/model.safetensors";
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd == -1)
+    {
+        std::cerr << "could not open model file";
+        return -1;
+    }
+    // why are we not using read? remember the whole point of using mmap is that we don't copy it to
+    // RAM, this avoids that while still allowing us to know the number of bytes in the file.
+    struct stat file_info;
+    if (fstat(fd, &file_info) == -1)
+    {
+        std::cerr << "failure to get file info";
+        close(fd);
+        return -1;
+    }
+    long file_size = file_info.st_size;
+    if (file_size < 8)
+    {
+        std::cerr << "file size too small";
+        close(fd);
+        return -1;
+    }
+
+    // treat this pointer like the pointer to the first byte of the file
+    void *mapped_file = mmap(nullptr, file_info.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped_file == MAP_FAILED)
+    {
+        std::cerr << "memory map failed";
+        return -1;
+    }
+    uint64_t header_size = 0;
+    // we must cast our void pointer to one of a char pointer
+    const char *file_bytes = reinterpret_cast<char *>(mapped_file);
+    std::memcpy(&header_size, file_bytes, sizeof(header_size));
+    if (!(header_size <= file_size - 8))
+    {
+        std::cerr << "header size too large";
+        munmap(file_bytes, file_size);
+        return -1;
+    }
+
+    std::string header(header_size, '\0');
+
+    std::memcpy(header.data(), file_bytes + sizeof(header_size), header_size);
+    json header_json = json::parse(header);
+
+    std::unordered_map<std::string, uint64_t> offsets;
+
+    uint64_t max_offset = 0;
+    // Read-only: access key and value from pair from JSON header.
+    for (const auto &[name, tensor_info] : header_json.items())
+    {
+        if (name == "__metadata__")
+        {
+            continue;
+        }
+
+        const auto &data_offsets = tensor_info.at("data_offsets");
+
+        uint64_t start_offset = data_offsets.at(0).get<uint64_t>();
+        uint64_t end_offset = data_offsets.at(1).get<uint64_t>();
+        if (end_offset > file_size - 8 - header_size || !(start_offset <= end_offset))
+        {
+            std::cerr << "end offset out of bounds";
+            munmap(file_bytes, file_size);
+            return -1;
+        }
+
+        offsets.emplace(name, start_offset);
+        max_offset = std::max(max_offset, end_offset);
+
+        // Test.
+        std::cout << name << " starts at: " << start_offset
+                  << " ends at: " << end_offset << "\n";
+        std::cout << "we have to allocate this many bytes: " << (end_offset / 8) << '\n';
+    }
+    const char *tensor_data = file_bytes + sizeof(header_size) + header_size;
+
+    void *modelweights_gpu = nullptr;
+
+    if (cudaMalloc(&modelweights_gpu, max_offset) != 0)
+    {
+        std::cerr << "gpu mem allocation failed";
+        munmap(file_bytes, file_size);
+        return -1;
+    }
+    if (cudaMemcpy(modelweights_gpu, tensor_data, max_offset, cudaMemcpyHostToDevice) != 0)
+    {
+        std::cerr << "gpu mem copy failed";
+        cudaFree(modelweights_gpu);
+        munmap(file_bytes, file_size);
+        return -1;
+    }
+    munmap(file_bytes, file_size);
+
+    weights.model_storage = modelweights_gpu;
+    char *base = static_cast<char *>(weights.model_storage);
+
+    weights.embed_tokens = reinterpret_cast<__nv_bfloat16 *>(
+        base + offsets.at("model.embed_tokens.weight"));
+
+    weights.norm = reinterpret_cast<__nv_bfloat16 *>(base + offsets.at("model.norm.weight"));
+    // Must wire pointers to 2 rmsnorm vectors, four attention matrices, and 3
+    // mlp matrices, so each of the 16 layers has 9 weight tensors.
+    for (int layer = 0; layer < N_LAYERS; ++layer)
+    {
+        std::string prefix = "model.layers." + std::to_string(layer);
+        weights.w_q[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".self_attn.q_proj.weight"));
+        weights.w_k[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".self_attn.k_proj.weight"));
+        weights.w_v[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".self_attn.v_proj.weight"));
+        weights.w_o[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".self_attn.o_proj.weight"));
+
+        weights.input_layernorm[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".input_layernorm.weight"));
+
+        weights.post_attn_layernorms[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".post_attention_layernorm.weight"));
+
+        weights.mlp_gate_proj[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".mlp.gate_proj.weight"));
+
+        weights.mlp_up_proj[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".mlp.up_proj.weight"));
+
+        weights.mlp_down_proj[layer] = reinterpret_cast<__nv_bfloat16 *>(
+            base + offsets.at(prefix + ".mlp.down_proj.weight"));
+    }
+    return 0;
+}
+
 int main()
 {
     // checkGPUStatus();
     LLamaWeights weights{};
     if (loadLlamaModel(weights) != 0)
     {
-        return -1
+        return -1;
     }
 
     return 0;
