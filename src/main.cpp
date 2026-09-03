@@ -359,15 +359,30 @@ int loadModelMmap(LLamaWeights &weights)
     return 0;
 }
 
-std::vector<int> tokenizePrompt(const std::string &prompt, const std::string &tokenizer_path)
+std::vector<int> tokenize(Tokenizer &tokenizer)
 {
-    Tokenizer tokenizer;
-    std::string error;
-    tokenizer.load(tokenizer_path, &error);
-
+    std::string prompt;
+    // std::cin >> prompt;
+    prompt = "Hello World! "; // temporary hardcoded prompt
     std::vector<int> token_ids = tokenizer.encode(prompt);
-
     return token_ids;
+}
+
+int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
+{
+    void *token_id_gpu = nullptr;
+    if (cudaMalloc(&token_id_gpu, token_ids.size() * sizeof(int)) != 0)
+    {
+        std::cerr << "gpu token mem allocation failed";
+        return -1;
+    }
+    if (cudaMemcpy(token_id_gpu, token_ids.data(), token_ids.size() * sizeof(int), cudaMemcpyHostToDevice) != 0)
+    {
+        std::cerr << "gpu token mem copy failed";
+        return -1;
+    }
+
+    return 0;
 }
 int main()
 {
