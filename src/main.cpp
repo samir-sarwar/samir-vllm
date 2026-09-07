@@ -95,7 +95,7 @@ int loadLlamaModel(LLamaWeights &weights)
         std::cerr << "could not open safetensors file";
         return -1;
     }
-    uint64_t headersize = 0;
+    uint64_t headersize = 0; // 8X8 = 64
     // Read expects a char buffer to store the extracted data.
     // We cast to tell cpp to treat this variable's memory as an 8-byte
     // destination buffer. We know its size is 8 bytes, but we can also use sizeof.
@@ -115,8 +115,15 @@ int loadLlamaModel(LLamaWeights &weights)
     std::string header(headersize, '\0');
     // header.data points to string's actual character buffer.
     safetensors_file.read(header.data(), headersize);
+
+
+
+    
     // Convert this bigass string into a json object.
     json header_json = json::parse(header);
+
+    std::cout << header_json;
+
 
     // The way we are going to store tensor -> starting byte offset is by using
     // a hashmap.
@@ -144,9 +151,9 @@ int loadLlamaModel(LLamaWeights &weights)
         max_offset = std::max(max_offset, end_offset);
 
         // Test.
-        std::cout << name << " starts at: " << start_offset
-                  << " ends at: " << end_offset << "\n";
-        std::cout << "we have to allocate this many bytes: " << (end_offset / 8) << '\n';
+        // std::cout << name << " starts at: " << start_offset
+        //           << " ends at: " << end_offset << "\n";
+        // std::cout << "we have to allocate this many bytes: " << (end_offset / 8) << '\n';
     }
     // Now we have to read the raw tensor data, copy it to memory, and then copy
     // it to the gpu. Our file ptr is now at the start of tensor data: it started
@@ -262,7 +269,7 @@ int loadModelMmap(LLamaWeights &weights)
     if (!(header_size <= file_size - 8))
     {
         std::cerr << "header size too large";
-        munmap(file_bytes, file_size);
+        munmap(mapped_file, file_size);
         return -1;
     }
 
@@ -289,7 +296,7 @@ int loadModelMmap(LLamaWeights &weights)
         if (end_offset > file_size - 8 - header_size || !(start_offset <= end_offset))
         {
             std::cerr << "end offset out of bounds";
-            munmap(file_bytes, file_size);
+            munmap(mapped_file, file_size);
             return -1;
         }
 
@@ -308,17 +315,17 @@ int loadModelMmap(LLamaWeights &weights)
     if (cudaMalloc(&modelweights_gpu, max_offset) != 0)
     {
         std::cerr << "gpu mem allocation failed";
-        munmap(file_bytes, file_size);
+        munmap(mapped_file, file_size);
         return -1;
     }
     if (cudaMemcpy(modelweights_gpu, tensor_data, max_offset, cudaMemcpyHostToDevice) != 0)
     {
         std::cerr << "gpu mem copy failed";
         cudaFree(modelweights_gpu);
-        munmap(file_bytes, file_size);
+        munmap(mapped_file, file_size);
         return -1;
     }
-    munmap(file_bytes, file_size);
+    munmap(mapped_file, file_size);
 
     weights.model_storage = modelweights_gpu;
     char *base = static_cast<char *>(weights.model_storage);
@@ -358,7 +365,7 @@ int loadModelMmap(LLamaWeights &weights)
     }
     return 0;
 }
-
+/* 
 std::vector<int> tokenize(Tokenizer &tokenizer)
 {
     std::string prompt;
@@ -367,7 +374,8 @@ std::vector<int> tokenize(Tokenizer &tokenizer)
     std::vector<int> token_ids = tokenizer.encode(prompt);
     return token_ids;
 }
-
+*/
+/* 
 int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
 {
     void *token_id_gpu = nullptr;
@@ -384,6 +392,7 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
 
     return 0;
 }
+*/
 int main()
 {
     // checkGPUStatus();
