@@ -396,8 +396,6 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
         std::cerr << "gpu activation token mem allocation failed";
         return -1;
     }
-    __nv_bfloat16* input_embeddings;
-    cudaMalloc(&input_embeddings, 2048 * sizeof(__nv_bfloat16) * 2048);
 
     if (launchEmbeddingGather(
         token_id_gpu,
