@@ -365,7 +365,7 @@ int loadModelMmap(LLamaWeights &weights)
     }
     return 0;
 }
-/* 
+
 std::vector<int> tokenize(Tokenizer &tokenizer)
 {
     std::string prompt;
@@ -374,8 +374,7 @@ std::vector<int> tokenize(Tokenizer &tokenizer)
     std::vector<int> token_ids = tokenizer.encode(prompt);
     return token_ids;
 }
-*/
-/* 
+ 
 int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
 {
     void *token_id_gpu = nullptr;
@@ -392,7 +391,7 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
 
     return 0;
 }
-*/
+
 int main()
 {
     // checkGPUStatus();
