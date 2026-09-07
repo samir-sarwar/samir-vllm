@@ -374,10 +374,11 @@ std::vector<int> tokenize(Tokenizer &tokenizer)
     std::vector<int> token_ids = tokenizer.encode(prompt);
     return token_ids;
 }
- 
+
+
 int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
 {
-    void *token_id_gpu = nullptr;
+    int *token_id_gpu = nullptr;
     if (cudaMalloc(&token_id_gpu, token_ids.size() * sizeof(int)) != 0)
     {
         std::cerr << "gpu token mem allocation failed";
@@ -388,6 +389,27 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
         std::cerr << "gpu token mem copy failed";
         return -1;
     }
+
+    __nv_bfloat16 *activations_gpu;
+    if (cudaMalloc(&activations_gpu, token_ids.size()*2048*sizeof(__nv_bfloat16)) != 0)
+    {
+        std::cerr << "gpu activation token mem allocation failed";
+        return -1;
+    }
+    __nv_bfloat16* input_embeddings;
+    cudaMalloc(&input_embeddings, 2048 * sizeof(__nv_bfloat16) * 2048);
+
+    if (launchEmbeddingGather(
+        token_id_gpu,
+        weights.embed_tokens,
+        activations_gpu,
+        static_cast<int>(token_ids.size())) != cudaSuccess)
+    {
+        std::cerr << "embedding kernel launch failed";
+        return -1;
+    }
+
+    int token_count = token_ids.size();
 
     return 0;
 }
