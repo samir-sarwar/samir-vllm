@@ -1,5 +1,6 @@
 #pragma once
-
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 // GPU entry points called by the host-side program.
 // Add inference-kernel declarations here as we implement them.
 void warmUpGpu();

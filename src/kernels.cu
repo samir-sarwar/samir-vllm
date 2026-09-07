@@ -15,8 +15,8 @@ void warmUpGpu()
 }
 
 __global__ void embeddingGatherKernel(__nv_bfloat16 *embed_tokens,
-      __nv_bfloat16 *activations_gpu,
-       int *token_id_gpu,
+      const __nv_bfloat16 *activations_gpu,
+       const int *token_id_gpu,
     int token_count)
 {
     // get thread unique global num, which block x threads per block + thread position
@@ -24,11 +24,11 @@ __global__ void embeddingGatherKernel(__nv_bfloat16 *embed_tokens,
 
     const int total_values = token_count * 2048;
 
-    if(index > total_values){
+    if(index >= total_values){
         return;
     }
     // finds out which prompt token this output belongs to 
-    int token_position = index / 2048
+    int token_position = index / 2048;
 
     const int hidden_index = index % 2048;
 
@@ -50,12 +50,12 @@ cudaError_t launchEmbeddingGather(
         // How many blocks, rounding upwards 
         const int blocks = (total_values + threads_per_block -1) / threads_per_block;
 
-        embeddingGatherKernel<<blocks, threads_per_block>>(
+        embeddingGatherKernel<<<blocks, threads_per_block>>>(
             embed_tokens,
-            activations_gpu
+            activations_gpu,
             token_id_gpu,
             token_count
-            );
+        );
 
         return cudaGetLastError();
 

@@ -396,18 +396,17 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
         std::cerr << "gpu activation token mem allocation failed";
         return -1;
     }
+    int token_count = static_cast<int>(token_ids.size());
 
     if (launchEmbeddingGather(
         token_id_gpu,
         weights.embed_tokens,
         activations_gpu,
-        static_cast<int>(token_ids.size())) != cudaSuccess)
+        token_count) != cudaSuccess)
     {
         std::cerr << "embedding kernel launch failed";
         return -1;
     }
-
-    int token_count = token_ids.size();
 
     return 0;
 }
