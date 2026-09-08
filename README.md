@@ -2,23 +2,28 @@
 
 > Building a small LLM inference engine from the ground up with C++ and CUDA.
 
-This project is my hands-on attempt to understand what happens between a prompt and a generated token: loading a model's weights, moving data to the GPU, and eventually running the transformer efficiently.
+This project is my hands-on attempt to understand what happens between a prompt and a generated token: loading model weights, moving data to the GPU, and building the transformer execution path piece by piece.
 
-[![Watch the first build video](https://img.youtube.com/vi/ef0mOukUE6U/hqdefault.jpg)](https://youtu.be/ef0mOukUE6U?si=DwP8ENN0enIp4HGy)
+## Build series
 
-**▶ [Watch the first video in the series](https://youtu.be/ef0mOukUE6U?si=DwP8ENN0enIp4HGy)** — more build updates are on the way.
+| Part 0 | Part 1 |
+| :---: | :---: |
+| [![Part 0: AI inference explained](https://img.youtube.com/vi/ef0mOukUE6U/hqdefault.jpg)](https://youtu.be/ef0mOukUE6U?si=DwP8ENN0enIp4HGy) | [![Part 1: Loading SafeTensor weights](https://img.youtube.com/vi/39_gWVbYgB4/hqdefault.jpg)](https://youtu.be/39_gWVbYgB4?si=cmMyfK0BywNGfd5o) |
+| [AI inference, simply explained](https://youtu.be/ef0mOukUE6U?si=DwP8ENN0enIp4HGy) | [Loading SafeTensor model weights to the GPU](https://youtu.be/39_gWVbYgB4?si=cmMyfK0BywNGfd5o) |
+
+More videos are on the way as the engine develops.
 
 ## What works so far
 
-- A C++17 / CUDA project scaffold built with CMake.
-- CUDA device inspection and a GPU warm-up kernel.
-- Direct loading of a `model.safetensors` file: parse its JSON metadata, read tensor offsets, and copy raw weights into GPU memory.
-- A typed weight layout for the Llama 3.2 1B Instruct architecture, with direct pointers to embedding, normalization, attention, and MLP tensors for each of its 16 layers.
-- A local tokenizer implementation and tokenizer test target.
+- A C++17 / CUDA project, built with CMake and linked with ICU for Unicode-aware tokenization.
+- Direct `model.safetensors` loading: parse metadata, validate tensor offsets, and copy the raw BF16 weights to GPU memory. There is also a memory-mapped loader implementation to avoid an extra CPU-side copy.
+- A fixed Llama 3.2 1B Instruct weight layout, with direct pointers to the embedding, normalization, attention, and MLP tensors across all 16 layers.
+- A local BPE tokenizer that supports Unicode, special tokens, encode/decode, and the Instruct chat prompt format; its expected output is covered by a dedicated test executable.
+- The first inference kernel: CUDA embedding gather, with prefill setup that copies prompt token IDs to the GPU and allocates activation memory.
 
 ## What I’m building toward
 
-The next milestones are token embedding lookup, transformer-layer CUDA kernels, and end-to-end autoregressive generation. Along the way, I plan to add the pieces that make inference efficient—attention, KV-cache management, and batching—while documenting what I learn.
+Next up is turning the embedding output into a complete transformer pass: RMSNorm, projections, RoPE, attention, residual connections, and the MLP. From there, the goal is autoregressive token generation, followed by KV-cache management and batching.
 
 ## Build
 
@@ -27,12 +32,15 @@ The next milestones are token embedding lookup, transformer-layer CUDA kernels, 
 - A CUDA-capable NVIDIA GPU and CUDA Toolkit
 - CMake 3.24+
 - A C++17 compiler
+- ICU development libraries
 - Model weights at `models/llama-3.2-1b-instruct/model.safetensors`
+- The matching tokenizer at `models/llama-3.2-1b-instruct/tokenizer.model`
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ./build/samir-vllm
+./build/tokenizer-test models/llama-3.2-1b-instruct/tokenizer.model
 ```
 
 ## Project layout
