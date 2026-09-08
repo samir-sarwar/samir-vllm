@@ -116,14 +116,10 @@ int loadLlamaModel(LLamaWeights &weights)
     // header.data points to string's actual character buffer.
     safetensors_file.read(header.data(), headersize);
 
-
-
-    
     // Convert this bigass string into a json object.
     json header_json = json::parse(header);
 
     std::cout << header_json;
-
 
     // The way we are going to store tensor -> starting byte offset is by using
     // a hashmap.
@@ -375,7 +371,6 @@ std::vector<int> tokenize(Tokenizer &tokenizer)
     return token_ids;
 }
 
-
 int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
 {
     int *token_id_gpu = nullptr;
@@ -391,7 +386,7 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
     }
 
     __nv_bfloat16 *activations_gpu;
-    if (cudaMalloc(&activations_gpu, token_ids.size()*2048*sizeof(__nv_bfloat16)) != 0)
+    if (cudaMalloc(&activations_gpu, token_ids.size() * 2048 * sizeof(__nv_bfloat16)) != 0)
     {
         std::cerr << "gpu activation token mem allocation failed";
         return -1;
@@ -399,10 +394,10 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
     int token_count = static_cast<int>(token_ids.size());
 
     if (launchEmbeddingGather(
-        token_id_gpu,
-        weights.embed_tokens,
-        activations_gpu,
-        token_count) != cudaSuccess)
+            token_id_gpu,
+            weights.embed_tokens,
+            activations_gpu,
+            token_count) != cudaSuccess)
     {
         std::cerr << "embedding kernel launch failed";
         return -1;
