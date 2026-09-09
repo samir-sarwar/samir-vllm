@@ -58,11 +58,11 @@ __global__ void rmsNormKernel(
 
     partial[tid] = x0 * x0 + x1 * x1;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    for (int i = blockDim.x / 2; i > 0; i >>= 1)
     {
-        if (tid < stride)
+        if (tid < i)
         {
-            partial[tid] += partial[tid + stride];
+            partial[tid] += partial[tid + i];
         }
 
         __syncthreads();
