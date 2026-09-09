@@ -106,3 +106,22 @@ cudaError_t launchEmbeddingGather(
 
     return cudaGetLastError();
 }
+
+cudaError_t launchRmsNorm(
+    const __nv_bfloat16 *input,
+    __nv_bfloat16 *output,
+    const __nv_bfloat16 *norm_weights,
+    int token_count)
+{
+    if (token_count <= 0)
+    {
+        return cudaSuccess;
+    }
+
+    rmsNormKernel<<<token_count, 1024>>>(
+        input,
+        output,
+        norm_weights);
+
+    return cudaGetLastError();
+}
