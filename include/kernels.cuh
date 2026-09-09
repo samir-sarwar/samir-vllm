@@ -11,7 +11,7 @@ cudaError_t launchEmbeddingGather(
     int token_count);
 
 cudaError_t launchRmsNorm(
-    activations_gpu,
-    normalized_gpu,
-    weights.input_layernorm[0],
-    token_count);
+    const __nv_bfloat16 *input,
+    __nv_bfloat16 *output,
+    const __nv_bfloat16 *norm_weights,
+    int token_count);

@@ -403,6 +403,39 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
         return -1;
     }
 
+    __nv_bfloat16 *normalized_gpu = nullptr;
+
+    const size_t activation_bytes =
+        static_cast<size_t>(token_count) *
+        2048 *
+        sizeof(__nv_bfloat16);
+
+    if (cudaMalloc(&normalized_gpu, activation_bytes) != cudaSuccess)
+    {
+        std::cerr << "gpu RMSNorm output allocation failed\n";
+        return -1;
+    }
+
+    if (launchRmsNorm(
+            activations_gpu,
+            normalized_gpu,
+            weights.input_layernorm[0],
+            token_count) != cudaSuccess)
+    {
+        std::cerr << "RMSNorm kernel launch failed\n";
+        return -1;
+    }
+
+    cudaError_t execution_error = cudaDeviceSynchronize();
+
+    if (execution_error != cudaSuccess)
+    {
+        std::cerr << "RMSNorm execution failed: "
+                  << cudaGetErrorString(execution_error)
+                  << '\n';
+        return -1;
+    }
+
     return 0;
 }
 
