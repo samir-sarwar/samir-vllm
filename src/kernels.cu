@@ -58,6 +58,32 @@ __global__ void rmsNormKernel(
 
     partial[tid] = x0 * x0 + x1 * x1;
     __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            partial[tid] += partial[tid + stride];
+        }
+
+        __syncthreads();
+    }
+    if (tid == 0)
+    {
+        partial[0] =
+            rsqrtf(partial[0] / static_cast<float>(HIDDEN_SIZE) + RMS_EPS);
+    }
+
+    __syncthreads();
+
+    const float inverse_rms = partial[0];
+    const float weight0 = __bfloat162float(norm_weights[tid]);
+    const float weight1 = __bfloat162float(norm_weights[tid + 1024]);
+
+    output[base + tid] =
+        __float2bfloat16(x0 * inverse_rms * weight0);
+
+    output[base + tid + 1024] =
+        __float2bfloat16(x1 * inverse_rms * weight1);
 }
 
 cudaError_t launchEmbeddingGather(
