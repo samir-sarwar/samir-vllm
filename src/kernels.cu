@@ -40,6 +40,26 @@ __global__ void embeddingGatherKernel(const __nv_bfloat16 *embed_tokens,
     activations_gpu[index] = embed_tokens[token_id * 2048 + hidden_index];
 }
 
+constexpr int HIDDEN_SIZE = 2048;
+constexpr float RMS_EPS = 1.0e-5f;
+
+__global__ void rmsNormKernel(
+    const __nv_bfloat16 *input,
+    __nv_bfloat16 *output,
+    const __nv_bfloat16 *norm_weights)
+{
+    __shared__ float partial[1024];
+
+    const int tid = threadIdx.x;
+    const int base = blockIdx.x * HIDDEN_SIZE;
+
+    const float x0 = __bfloat162float(input[base + tid]);
+    const float x1 = __bfloat162float(input[base + tid + 1024]);
+
+    partial[tid] = x0 * x0 + x1 * x1;
+    __syncthreads();
+}
+
 cudaError_t launchEmbeddingGather(
     const int *token_id_gpu,
     const __nv_bfloat16 *embed_tokens,
