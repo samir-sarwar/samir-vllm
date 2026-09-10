@@ -98,8 +98,50 @@ __global__ void ropeKernel(
     int projection_size,
     int head_size)
 {
+    const int work_index =
+        blockIdx.x * blockDim.x + threadIdx.x;
 
-    // TO-DO: implement kernel
+    const int pairs_per_head = head_size / 2;
+    const int pairs_per_token = projection_size / 2;
+    const int total_pairs = token_count * pairs_per_token;
+
+    if (work_index >= total_pairs)
+    {
+        return;
+    }
+
+    const int token_index = work_index / pairs_per_token;
+    const int pair_in_token = work_index % pairs_per_token;
+
+    const int head_index = pair_in_token / pairs_per_head;
+    const int pair_index = pair_in_token % pairs_per_head;
+
+    const int head_base =
+        token_index * projection_size +
+        head_index * head_size;
+
+    const int first_index = head_base + pair_index;
+    const int second_index =
+        first_index + pairs_per_head;
+
+    const float x0 =
+        __bfloat162float(input[first_index]);
+
+    const float x1 =
+        __bfloat162float(input[second_index]);
+
+    const int position = position_ids[token_index];
+    const int table_index =
+        position * pairs_per_head + pair_index;
+
+    const float cosine = cos_table[table_index];
+    const float sine = sin_table[table_index];
+
+    input[first_index] =
+        __float2bfloat16(x0 * cosine - x1 * sine);
+
+    input[second_index] =
+        __float2bfloat16(x0 * sine + x1 * cosine);
 }
 
 /* -------------- Kernel Launchers -------------- */
