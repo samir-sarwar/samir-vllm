@@ -14,10 +14,13 @@ void warmUpGpu()
     warmUpKernel<<<1, 1>>>();
 }
 
-__global__ void embeddingGatherKernel(const __nv_bfloat16 *embed_tokens,
-                                      __nv_bfloat16 *activations_gpu,
-                                      const int *token_id_gpu,
-                                      int token_count)
+/* -------------- Kernels -------------- */
+
+__global__ void embeddingGatherKernel(
+    const __nv_bfloat16 *embed_tokens,
+    __nv_bfloat16 *activations_gpu,
+    const int *token_id_gpu,
+    int token_count)
 {
     // get thread unique global num, which block x threads per block + thread position
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -86,6 +89,20 @@ __global__ void rmsNormKernel(
         __float2bfloat16(x1 * inverse_rms * weight1);
 }
 
+__global__ void ropeKernel(
+    __nv_bfloat16 *input,
+    const int *position_ids,
+    const float *cos_table,
+    const float *sin_table,
+    int token_count,
+    int projection_size,
+    int head_size)
+{
+
+    // TO-DO: implement kernel
+}
+
+/* -------------- Kernel Launchers -------------- */
 cudaError_t launchEmbeddingGather(
     const int *token_id_gpu,
     const __nv_bfloat16 *embed_tokens,
