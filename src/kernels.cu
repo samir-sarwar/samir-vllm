@@ -184,3 +184,51 @@ cudaError_t launchRmsNorm(
 
     return cudaGetLastError();
 }
+
+cudaError_t launchRope(
+    __nv_bfloat16 *input,
+    const int *position_ids,
+    const float *cos_table,
+    const float *sin_table,
+    int token_count,
+    int projection_size,
+    int head_size)
+{
+    if (token_count == 0)
+    {
+        return cudaSuccess;
+    }
+
+    if (token_count < 0 ||
+        input == nullptr ||
+        position_ids == nullptr ||
+        cos_table == nullptr ||
+        sin_table == nullptr ||
+        projection_size <= 0 ||
+        head_size <= 0 ||
+        head_size % 2 != 0 ||
+        projection_size % head_size != 0)
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr int THREADS_PER_BLOCK = 256;
+
+    const int pairs_per_token = projection_size / 2;
+    const int total_pairs = token_count * pairs_per_token;
+
+    const int block_count =
+        (total_pairs + THREADS_PER_BLOCK - 1) /
+        THREADS_PER_BLOCK;
+
+    ropeKernel<<<block_count, THREADS_PER_BLOCK>>>(
+        input,
+        position_ids,
+        cos_table,
+        sin_table,
+        token_count,
+        projection_size,
+        head_size);
+
+    return cudaGetLastError();
+}

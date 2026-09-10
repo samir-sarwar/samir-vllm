@@ -15,3 +15,12 @@ cudaError_t launchRmsNorm(
     __nv_bfloat16 *output,
     const __nv_bfloat16 *norm_weights,
     int token_count);
+
+cudaError_t launchRope(
+    __nv_bfloat16 *input,
+    const int *position_ids,
+    const float *cos_table,
+    const float *sin_table,
+    int token_count,
+    int projection_size,
+    int head_size);
