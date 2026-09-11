@@ -235,6 +235,12 @@ __global__ void rmsNormKernel(
         __float2bfloat16(x1 * inverse_rms * weight1);
 }
 
+cudaError_t initializeRopeTables(
+    float **cos_table_gpu,
+    float **sin_table_gpu,
+    int max_sequence_length)
+{
+}
 __global__ void ropeKernel(
     __nv_bfloat16 *input,
     const int *position_ids,
