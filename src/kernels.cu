@@ -1,5 +1,8 @@
 #include "kernels.cuh"
 
+#include <cmath>
+#include <vector>
+
 namespace
 {
 
@@ -45,6 +48,149 @@ __global__ void embeddingGatherKernel(
 
 constexpr int HIDDEN_SIZE = 2048;
 constexpr float RMS_EPS = 1.0e-5f;
+constexpr int ROPE_HEAD_SIZE = 64;
+constexpr int ROPE_PAIRS_PER_HEAD = ROPE_HEAD_SIZE / 2;
+constexpr float ROPE_THETA = 500000.0f;
+constexpr float ROPE_FACTOR = 32.0f;
+constexpr float ROPE_LOW_FREQUENCY_FACTOR = 1.0f;
+constexpr float ROPE_HIGH_FREQUENCY_FACTOR = 4.0f;
+constexpr int ROPE_ORIGINAL_MAX_LENGTH = 8192;
+constexpr float PI = 3.14159265358979323846f;
+
+cudaError_t initializeRopeTables(
+    float **cos_table_gpu,
+    float **sin_table_gpu,
+    int max_sequence_length)
+{
+    if (cos_table_gpu == nullptr ||
+        sin_table_gpu == nullptr ||
+        max_sequence_length <= 0)
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    *cos_table_gpu = nullptr;
+    *sin_table_gpu = nullptr;
+
+    std::vector<float> inverse_frequencies(ROPE_PAIRS_PER_HEAD);
+
+    for (int pair = 0; pair < ROPE_PAIRS_PER_HEAD; ++pair)
+    {
+        inverse_frequencies[pair] =
+            1.0f /
+            std::pow(
+                ROPE_THETA,
+                (2.0f * static_cast<float>(pair)) /
+                    static_cast<float>(ROPE_HEAD_SIZE));
+    }
+
+    const float low_frequency_wavelength =
+        static_cast<float>(ROPE_ORIGINAL_MAX_LENGTH) /
+        ROPE_LOW_FREQUENCY_FACTOR;
+
+    const float high_frequency_wavelength =
+        static_cast<float>(ROPE_ORIGINAL_MAX_LENGTH) /
+        ROPE_HIGH_FREQUENCY_FACTOR;
+
+    for (int pair = 0; pair < ROPE_PAIRS_PER_HEAD; ++pair)
+    {
+        const float original_frequency = inverse_frequencies[pair];
+        const float wavelength = 2.0f * PI / original_frequency;
+
+        if (wavelength > low_frequency_wavelength)
+        {
+            inverse_frequencies[pair] =
+                original_frequency / ROPE_FACTOR;
+        }
+        else if (wavelength >= high_frequency_wavelength)
+        {
+            const float smooth =
+                (static_cast<float>(ROPE_ORIGINAL_MAX_LENGTH) /
+                     wavelength -
+                 ROPE_LOW_FREQUENCY_FACTOR) /
+                (ROPE_HIGH_FREQUENCY_FACTOR -
+                 ROPE_LOW_FREQUENCY_FACTOR);
+
+            inverse_frequencies[pair] =
+                (1.0f - smooth) *
+                    (original_frequency / ROPE_FACTOR) +
+                smooth * original_frequency;
+        }
+    }
+
+    const size_t table_elements =
+        static_cast<size_t>(max_sequence_length) *
+        ROPE_PAIRS_PER_HEAD;
+
+    std::vector<float> cos_table_cpu(table_elements);
+    std::vector<float> sin_table_cpu(table_elements);
+
+    for (int position = 0;
+         position < max_sequence_length;
+         ++position)
+    {
+        for (int pair = 0; pair < ROPE_PAIRS_PER_HEAD; ++pair)
+        {
+            const float angle =
+                static_cast<float>(position) *
+                inverse_frequencies[pair];
+
+            const size_t index =
+                static_cast<size_t>(position) *
+                    ROPE_PAIRS_PER_HEAD +
+                pair;
+
+            cos_table_cpu[index] = std::cos(angle);
+            sin_table_cpu[index] = std::sin(angle);
+        }
+    }
+
+    const size_t table_bytes = table_elements * sizeof(float);
+
+    cudaError_t error = cudaMalloc(cos_table_gpu, table_bytes);
+    if (error != cudaSuccess)
+    {
+        return error;
+    }
+
+    error = cudaMalloc(sin_table_gpu, table_bytes);
+    if (error != cudaSuccess)
+    {
+        cudaFree(*cos_table_gpu);
+        *cos_table_gpu = nullptr;
+        return error;
+    }
+
+    error = cudaMemcpy(
+        *cos_table_gpu,
+        cos_table_cpu.data(),
+        table_bytes,
+        cudaMemcpyHostToDevice);
+    if (error != cudaSuccess)
+    {
+        cudaFree(*cos_table_gpu);
+        cudaFree(*sin_table_gpu);
+        *cos_table_gpu = nullptr;
+        *sin_table_gpu = nullptr;
+        return error;
+    }
+
+    error = cudaMemcpy(
+        *sin_table_gpu,
+        sin_table_cpu.data(),
+        table_bytes,
+        cudaMemcpyHostToDevice);
+    if (error != cudaSuccess)
+    {
+        cudaFree(*cos_table_gpu);
+        cudaFree(*sin_table_gpu);
+        *cos_table_gpu = nullptr;
+        *sin_table_gpu = nullptr;
+        return error;
+    }
+
+    return cudaSuccess;
+}
 
 __global__ void rmsNormKernel(
     const __nv_bfloat16 *input,

@@ -8,6 +8,7 @@
 // Grabs json header for functions to parse and create json objects in cpp.
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <numeric>
 #include <unordered_map>
 #include <algorithm>
 #include <vector>
@@ -371,9 +372,34 @@ std::vector<int> tokenize(Tokenizer &tokenizer)
     return token_ids;
 }
 
-int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
+int prefill(
+    const std::vector<int> &token_ids,
+    LLamaWeights &weights,
+    const float *cos_table_gpu,
+    const float *sin_table_gpu)
 {
+    if (token_ids.empty() ||
+        cos_table_gpu == nullptr ||
+        sin_table_gpu == nullptr)
+    {
+        std::cerr << "invalid prefill input\n";
+        return -1;
+    }
+
+    const int token_count = static_cast<int>(token_ids.size());
     int *token_id_gpu = nullptr;
+    int *position_ids_gpu = nullptr;
+    __nv_bfloat16 *activations_gpu = nullptr;
+    __nv_bfloat16 *normalized_gpu = nullptr;
+
+    auto free_prefill_buffers = [&]()
+    {
+        cudaFree(token_id_gpu);
+        cudaFree(position_ids_gpu);
+        cudaFree(activations_gpu);
+        cudaFree(normalized_gpu);
+    };
+
     if (cudaMalloc(&token_id_gpu, token_ids.size() * sizeof(int)) != 0)
     {
         std::cerr << "gpu token mem allocation failed";
@@ -382,16 +408,39 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
     if (cudaMemcpy(token_id_gpu, token_ids.data(), token_ids.size() * sizeof(int), cudaMemcpyHostToDevice) != 0)
     {
         std::cerr << "gpu token mem copy failed";
+        free_prefill_buffers();
         return -1;
     }
 
-    __nv_bfloat16 *activations_gpu;
+    std::vector<int> position_ids_cpu(token_count);
+    std::iota(position_ids_cpu.begin(), position_ids_cpu.end(), 0);
+
+    if (cudaMalloc(
+            &position_ids_gpu,
+            position_ids_cpu.size() * sizeof(int)) != cudaSuccess)
+    {
+        std::cerr << "gpu position ID allocation failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    if (cudaMemcpy(
+            position_ids_gpu,
+            position_ids_cpu.data(),
+            position_ids_cpu.size() * sizeof(int),
+            cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        std::cerr << "gpu position ID copy failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
     if (cudaMalloc(&activations_gpu, token_ids.size() * 2048 * sizeof(__nv_bfloat16)) != 0)
     {
         std::cerr << "gpu activation token mem allocation failed";
+        free_prefill_buffers();
         return -1;
     }
-    int token_count = static_cast<int>(token_ids.size());
 
     if (launchEmbeddingGather(
             token_id_gpu,
@@ -400,10 +449,9 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
             token_count) != cudaSuccess)
     {
         std::cerr << "embedding kernel launch failed";
+        free_prefill_buffers();
         return -1;
     }
-
-    __nv_bfloat16 *normalized_gpu = nullptr;
 
     const size_t activation_bytes =
         static_cast<size_t>(token_count) *
@@ -413,6 +461,7 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
     if (cudaMalloc(&normalized_gpu, activation_bytes) != cudaSuccess)
     {
         std::cerr << "gpu RMSNorm output allocation failed\n";
+        free_prefill_buffers();
         return -1;
     }
 
@@ -423,6 +472,7 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
             token_count) != cudaSuccess)
     {
         std::cerr << "RMSNorm kernel launch failed\n";
+        free_prefill_buffers();
         return -1;
     }
 
@@ -433,9 +483,13 @@ int prefill(const std::vector<int> &token_ids, LLamaWeights &weights)
         std::cerr << "RMSNorm execution failed: "
                   << cudaGetErrorString(execution_error)
                   << '\n';
+        free_prefill_buffers();
         return -1;
     }
 
+    // position_ids_gpu and the RoPE tables are ready for Q and K once their
+    // projection buffers are added. RoPE must not be applied to normalized_gpu.
+    free_prefill_buffers();
     return 0;
 }
 
@@ -451,6 +505,24 @@ int main()
         return -1;
     }
 
+    constexpr int MAX_SEQUENCE_LENGTH = 2048;
+    float *cos_table_gpu = nullptr;
+    float *sin_table_gpu = nullptr;
+
+    cudaError_t rope_initialization_error = initializeRopeTables(
+        &cos_table_gpu,
+        &sin_table_gpu,
+        MAX_SEQUENCE_LENGTH);
+
+    if (rope_initialization_error != cudaSuccess)
+    {
+        std::cerr << "RoPE table initialization failed: "
+                  << cudaGetErrorString(rope_initialization_error)
+                  << '\n';
+        cudaFree(weights.model_storage);
+        return -1;
+    }
+
     Tokenizer tokenizer;
     std::string tokenizer_error;
 
@@ -458,8 +530,22 @@ int main()
                         &tokenizer_error))
     {
         std::cerr << tokenizer_error << '\n';
+        cudaFree(cos_table_gpu);
+        cudaFree(sin_table_gpu);
+        cudaFree(weights.model_storage);
         return -1;
     }
 
-    return 0;
+    std::vector<int> token_ids = tokenize(tokenizer);
+    const int prefill_status = prefill(
+        token_ids,
+        weights,
+        cos_table_gpu,
+        sin_table_gpu);
+
+    cudaFree(cos_table_gpu);
+    cudaFree(sin_table_gpu);
+    cudaFree(weights.model_storage);
+
+    return prefill_status;
 }

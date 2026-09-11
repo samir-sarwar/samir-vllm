@@ -16,6 +16,11 @@ cudaError_t launchRmsNorm(
     const __nv_bfloat16 *norm_weights,
     int token_count);
 
+cudaError_t initializeRopeTables(
+    float **cos_table_gpu,
+    float **sin_table_gpu,
+    int max_sequence_length);
+
 cudaError_t launchRope(
     __nv_bfloat16 *input,
     const int *position_ids,
