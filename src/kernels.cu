@@ -208,6 +208,9 @@ __global__ void rmsNormKernel(
     partial[tid] = x0 * x0 + x1 * x1;
     __syncthreads();
     for (int i = blockDim.x / 2; i > 0; i >>= 1)
+    // 512 -> 256 -> 128 -> 64 -> ... -> 2 -> 1
+    // partial [0] += partial[512]
+    // partial [511] += partial[1023]
     {
         if (tid < i)
         {
@@ -333,6 +336,9 @@ cudaError_t launchRmsNorm(
         input,
         output,
         norm_weights);
+    // one cuda block = one token
+    // 1024 threads = one block
+    // one thread = two hidden values
 
     return cudaGetLastError();
 }
