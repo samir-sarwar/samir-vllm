@@ -16,6 +16,12 @@ This project is my hands-on attempt to understand what happens between a prompt 
 | [![Part 2: Embedding gather kernel](https://img.youtube.com/vi/0V1lVIzGyqs/hqdefault.jpg)](https://youtu.be/0V1lVIzGyqs?si=Uut4WlzZrYMEpS6R) | [![Part 3: RMSNorm kernel](https://img.youtube.com/vi/my8VrOUVWo0/hqdefault.jpg)](https://youtu.be/my8VrOUVWo0?si=cuge6AsVmI3MfYUM) |
 | [Writing the embedding-table gather kernel](https://youtu.be/0V1lVIzGyqs?si=Uut4WlzZrYMEpS6R) | [Writing the RMSNorm kernel](https://youtu.be/my8VrOUVWo0?si=cuge6AsVmI3MfYUM) |
 
+### Part 4
+
+[![Part 4: Rotary Position Embedding (RoPE)](https://img.youtube.com/vi/4gL0hd9UEAY/hqdefault.jpg)](https://youtu.be/4gL0hd9UEAY?si=ii5LioF0gTTnEki6)
+
+**[Rotary Position Embedding (RoPE), explained simply](https://youtu.be/4gL0hd9UEAY?si=ii5LioF0gTTnEki6)**
+
 More videos are on the way as the engine develops.
 
 ## What works so far
@@ -26,7 +32,7 @@ More videos are on the way as the engine develops.
 - A local BPE tokenizer that supports Unicode, special tokens, encode/decode, and the Instruct chat prompt format; its expected output is covered by a dedicated test executable.
 - A CUDA embedding-gather kernel and prefill path that copies prompt token IDs to the GPU and allocates activations.
 - A CUDA RMSNorm kernel for the 2,048-wide hidden state: it reduces in FP32, applies the learned BF16 weights, and is now run as the first operation of layer 0 during prefill.
-- Initial RoPE support: precomputed GPU sine/cosine tables for the model’s scaled rotary frequencies, plus a CUDA kernel ready to rotate query and key projections.
+- RoPE support for the model’s scaled rotary frequencies: GPU sine/cosine tables are initialized for a 2,048-token context, and a CUDA kernel is ready to rotate Q/K projection buffers.
 
 ## What I’m building toward
 
