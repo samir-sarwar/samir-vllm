@@ -327,3 +327,69 @@ This stretches its wavelength:
 
 'i=32i
 Why: fast pairs retain precise local position information, while stretched slow pairs remain useful across much longer contexts.
+Attention:
+Single Headed Attention:
+So this is the big kicker, and what you’ve probably heard a million times, especially on the famous paper ‘Attention is all you Need’ that really kickstarted the whole AI boom. In our engine we use Multi-headed attention but its good to start here to get a foundation. We may have jumped the gun a bit by talking about RoPE before really understanding attention, so I may change up the order of where this is in the notes.
+
+Pretty much though, you can think of it as what powers context within the prompt, it allows us to semantically understand what a word/token is trying to say by looking at other words in the prompt. A good example could be ‘I just clean windows’ for us humans thats pretty easy to understand, but if we were to just use regular feed forward network or something, theres no way of us to know if windows, mean actual windows, or the software windows meaning if we had ‘I just downloaded windows’ it’d think of windows in the same way despite the whole meaning being drastically different. Attention allows us to use other words in the prompt to actually understand what certain words mean. It’s like if I were to ask you as a human how did you understand the difference between the two sentences, you’d say it’d be the words clean and downloaded, this is precisely what we can do with attention, but how?
+
+The way we can measure the actual relevance from token to token would be through a vector dot product, you are already familiar with how we get token embedding vectors from the learned embedding table, and that’s now a key part of what we do here? If you’re keen you may have thought, why don’t we just do the dot product of one token, by the other tokens to measure their similarity, the problem is often words that might highly relevant to each other end up having very different token embeddings, furthermore it can be asymmetrical meaning one word can mean alot more to another word then the other way around, an easy way to think of this is an adjective and a noun: ‘Amazing food’ in this case their token embeddings would probably be very different leading to low similarity, as well as the fact that for food, the word Amazing is very relevant, but for Amazing it doesn’t really care about the word food.
+
+Rather than compare token embeddings directly, the model first learns two different representations of every token: a query and a key. The query represents what the current token is looking for, while the key represents what information that token can offer. We compute these values by multiplying a tokens embedding vector by a Query (W_q) and Key (W_k) matrix. W_q learns which combinations of a token’s current features describe what it needs to find. W_k learns which combinations describe what that token can provide. Their dot product measures whether what one token seeks matches what another token offers.
+
+Then, we simply take our token embedding vector and multiply it by these matrices to give us new vectors to use to calculate how much ‘attention’ one token pays to another. Multiplying it by those matrices can be called Q,K,V projection and it’s what we do in cuBLAS, in Video 6 of the series!
+
+Perfect, now you can think of their attention scores as being the dot product of the query and key vectors. The full attention score matrix can thus be given as
+
+S = QKT + M  
+Where M, is a mask as we don’t want to consider a key vector that comes after the query itself. We then divide by a scalar sqrt(dₖ) where dₖ is the size of one key vector in a single attention head. We use it because a dot product gets larger on average when it adds more dimensions. Without scaling, the attention scores could become very large, making softmax overly confident where almost all probability goes to one token. Lastly, a problem we can face is that this dot product could result in a negative value and its hard to infer what exactly that means so you can apply an exponential function to make them non-zero, and then normalize them so their values are within a set scale. This is exactly a process of softmax, thus the Attention Weight Matrix can be given as
+A = softmax(QKTdk + Mask)
+The attention-weight matrix tells us where each token should look, but it doesn’t yet tell us what information to take from those tokens. That is the purpose of the value vectors. Each value vector is created from the token’s current representation using its own learned matrix:
+V = X × Wvᵀ, you can think of values as the actual information that token can provide. Q and K determine the attention weights; V contains the information we transfer once we know which tokens matter.
+We therefore multiply the attention-weight matrix by the value matrix:
+O = A × V
+For a token i, its output is a weighted sum of the value vectors of the tokens it attends to:
+o_i = A[i,1] × v₁ + A[i,2] × v₂ + ... + A[i,i] × vᵢ
+Or… o_i = Σⱼ A[i,j] × v_j
+
+A high attention weight means that token’s value vector contributes more information to the new representation of token i. The output O is therefore a new context-aware representation for every token.
+
+Multi-headed Attention:
+So now that we understand single headed attention we know that one head can look at all the earlier tokens to work out which ones are relevant, and then take a weighted mixture of their value vectors. But then, why not just use one massive attention head and call it a day?
+The problem is that one attention head has to use a single definition of what “relevant” means. In a sentence, a token might need to care about multiple things at once, like maybe one earlier word tells us the subject, another tells us the tense, whereas another explains what a pronoun refers to, and another provides the actual topic. Having one head do all of this would be like asking one person to look for every possible pattern at the same time.
+Multi-headed attention lets the model look at the prompt from multiple different perspectives at the same time. Rather than creating one query, key, and value vector, we just split them into multiple smaller q,k,v vectors, with one set for each head. Each head has its own learned section of the Q, K, and V weight matrices, so each can learn different useful patterns.
+For our Llama 3.2 1B model, the query projection has 2,048 values per token. We split this into: 32 query heads × 64 values per head = 2,048
+So, after the Q projection, we can think of it as:
+Q = [Q₀, Q₁, Q₂, ..., Q₃₁]
+where every Qₕ is a smaller query matrix with shape: [# of tokens, 64].
+The same idea then also applies to keys and values. Each head runs the exact single-head attention calculation independently:
+Sₕ = (Qₕ × Kₕᵀ) / √64 + M
+Aₕ = softmax(Sₕ)
+head_outputₕ = Aₕ × Vₕ
+Each head can now attend to different earlier tokens! One of the heads could learn that the food token should look at Amazing as a key, another could care more about the earlier verb, surrounding sentence structure, or something else. The heads aren’t manually assigned jobs, instead the model just learns what is useful during training.
+Once every head has created its output, we concatenate them. This just means placing their 64-value output vectors beside each other.
+head_output₀: 64 values
+head_output₁: 64 values
+...
+head_output₃₁: 64 values
+32 × 64 = 2,048 values
+Meaning now for a layer, we have a 2048 valued multi head attention output per token We then multiply it by another learned weight matrix, Wₒ, called the output projection:
+attention_update = Concat(head_output₀, ..., head_output₃₁) × Wₒᵀ
+Wₒ lets the model mix the useful information discovered by the different heads. Finally, we add this attention update back to the token’s previous hidden state using a residual connection, you can think of the attention update as being Δx and we are adding the change to the old embedding token to get new hidden state
+new_hidden_state = old_hidden_state + attention_update
+Or… x’ = x + Δx
+Grouped Query Attention:
+One interesting part of LLama’s model architecture is that it uses Grouped Query attention, which pretty much means it splits key and value heads amongst multiple query heads. In our LLama 3.2 1B case in specific it has 32 query heads, but only 8 key heads and 8 value heads. This means every group of four query heads shares one key head and one value head:
+Q heads 0–3 use K,V head 0
+Q heads 4–7 use K,V head 1
+...
+Q heads 28–31 use K,V head 7
+
+So now our actual calculation for each query head h would be:
+
+kv_head = h / 4
+
+Sₕ = (Qₕ × K_kv_headᵀ) / √64 + M
+Aₕ = softmax(Sₕ)
+head_outputₕ = Aₕ × V_kv_head
+The reason we do this is that it keeps the multiple query perspectives that make multi-head attention so powerful, while using fewer key and value vectors. This saves a ton of KV-cache memory during inference. We’ll get into why that’s so important later on ;)
