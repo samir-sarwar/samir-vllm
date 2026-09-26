@@ -175,4 +175,155 @@ Now that we’ve seen an example, we’re ready for a general formulation, where
 
 Here, m denotes the position at which the vector is in, in the input prompt. Thus I assume that m is bounded, 0 < m <= token_count, where : m E Z. Now if we were to calculate the attention between two vectors, with query at pos m, and key at pos n, and attention vector = dot product of query and key. Using the knowledge of how the key vectors are transposed in the attention formula, we’d also transpose the rotation matrix, meaning it becomes -n, thus the angle difference we explained earlier.
 
-This simplified example only works in the 2D case though, in the case of higher dimensions we split them into groups of smaller ones with rotanial encodings then combine after. But this takes alot of memoery, so we can do element wise operations.
+This simplified example only works in the 2D case though, in the case of higher dimensions we split them into groups of smaller ones with rotanial encodings then combine after. But this takes alot of memoery, so we can do element wise operations. Note: lots of examples coming ->
+Here is one tiny RoPE example with one 2-number pair. Real Llama heads have 32 pairs, but the same calculation happens for each one.
+Assume the query for token A is:
+Q_A = [ 2 ]
+[ 1 ]
+Assume the key for token B is:
+K_B = [ 3 ]
+[ 4 ]
+Let their positions be:
+p_A = 2, p_B = 5
+And, just for this example, let this pair’s RoPE frequency be:
+ω = 0.1
+
+In reality we use the frequency formula we see in the code for each pair,
+RoPE calculates one angle per token:
+θ_A = p_A × ω = 2 × 0.1 = 0.2
+θ_B = p_B × ω = 5 × 0.1 = 0.5
+Now rotate the query:
+Q'\_A = [ 2·cos(0.2) - 1·sin(0.2) ]
+[ 2·sin(0.2) + 1·cos(0.2) ]
+Using:
+cos(0.2) ≈ 0.9801, sin(0.2) ≈ 0.1987
+we get:
+Q'\_A = [ 2(0.9801) - 1(0.1987) ] = [ 1.7615 ]
+[ 2(0.1987) + 1(0.9801) ] [ 1.3774 ]
+Now rotate the key:
+K'\_B = [ 3·cos(0.5) - 4·sin(0.5) ]
+[ 3·sin(0.5) + 4·cos(0.5) ]
+Using:
+cos(0.5) ≈ 0.8776, sin(0.5) ≈ 0.4794
+we get:
+K'\_B = [ 3(0.8776) - 4(0.4794) ] = [ 0.7150 ]
+[ 3(0.4794) + 4(0.8776) ] [ 4.9486 ]
+Attention now compares the rotated query and key with a dot product:
+Q'\_A · K'\_B = (1.7615)(0.7150) + (1.3774)(4.9486) ≈ 8.075
+That 8.075 is this pair’s contribution to the attention score.
+The important part is that token A was rotated by 0.2 radians and token B by 0.5 radians. Their difference is:
+θ_B - θ_A = 0.5 - 0.2 = 0.3
+which is also:
+(p_B - p_A)ω = (5 - 2)(0.1) = 0.3
+So the comparison naturally contains their relative distance:
+p_B - p_A = 3
+In a real head, this happens for all 32 RoPE pairs, and the attention dot product adds all of their contributions together.
+
+So to put it simply all we’re doing is rotating each weight in our query and key vectors for each of our tokens, they rotated based on which token position they have in the prompt, and then finally as you may be thinking dont we need to get the relation between all of them, yes we do that when we finally compute the dot product and the final attention scores go into its respective matrix, happens during attention.
+
+How it works for each of the rotations within the vector, query OR key itself is as such:
+
+For one token, the flow is:
+
+token embeddingQ, K, V
+Take that token’s Q vector. One head has 64 numbers:
+Q=[q0,q1,,q31,q32,q33,,q63]
+RoPE makes 32 coordinate pairs inside that one head:
+(q0,q32), (q1,q33), , (q31,q63)
+Then it rotates every one of those pairs using that token’s position.
+So for token 3:
+(q0,q32)rotateusingposition3
+
+(q1,q33)rotateusingposition3
+
+(q31,q63)rotateusingposition3
+That gives one finished position-aware query vector:
+Q'3
+The same happens to its key vector:
+
+K3K'3
+
+Only after every token has its own rotated Q and K does attention compare tokens:
+Q'3K'1
+
+Q'3K'2
+
+Q'3K'3
+More examples just to drive home the concept:
+Tiny fake head with 4 numbers instead of Llama’s real 64:
+
+Q3=[2, 5, 3, 7]
+Using the same half-split layout as your code, its RoPE pairs are:
+
+pair0=(2,3)
+
+pair1=(5,7)
+Now give each pair a different frequency:
+
+0=0.1
+
+1=0.01
+Both pairs are from token position 3, so:
+
+3,0=30.1=0.3
+
+3,1=30.01=0.03
+Pair 0 rotates more because its frequency is faster:
+(2,3) → [ 2·cos(0.3) - 3·sin(0.3) ] ≈ [ 1.024 ]
+[ 2·sin(0.3) + 3·cos(0.3) ] [ 3.457 ]
+Pair 1 rotates only a little because its frequency is slower:
+(5,7) → [ 5·cos(0.03) - 7·sin(0.03) ] ≈ [ 4.788 ]
+[ 5·sin(0.03) + 7·cos(0.03) ] [ 7.147 ]
+So the rotated query for token 3 becomes approximately:
+
+Q'3=[1.024, 4.788, 3.457, 7.147]
+Same token position; different pair frequencies; different rotation amounts.
+In the real model, this happens for all 32 pairs in a head.
+
+Remember though this is how the frequencies are actually calculated:
+
+i=12i/d
+
+=500000
+
+d=64
+
+Theta and d values coming from how LLama is.
+
+Last thing to note, is that in LLama we also scale the frequencies with pairs, why and how we do this noted below:
+
+Each RoPE pair has a frequency i, which determines how quickly it rotates as token position increases.
+
+anglep,i=pi
+A pair’s wavelength is the number of token positions needed for one full rotation:
+
+i=2i
+Therefore:
+
+largeishortwavelengthfastrotation
+
+smallilongwavelengthslowrotation
+Llama divides RoPE pairs into three wavelength regions:
+
+i<2048
+Keep fast frequencies unchanged:
+
+'i=i
+These pairs preserve detailed positional differences between nearby tokens.
+
+2048i8192
+Smoothly blend between original and slowed frequency:
+
+s=8192/i-14-1
+
+'i=(1-s)i32+si
+This prevents an abrupt change between neighboring pairs.
+
+i>8192
+Slow the already-slow frequency:
+
+'i=i32
+This stretches its wavelength:
+
+'i=32i
+Why: fast pairs retain precise local position information, while stretched slow pairs remain useful across much longer contexts.
