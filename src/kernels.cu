@@ -57,6 +57,10 @@ constexpr float ROPE_HIGH_FREQUENCY_FACTOR = 4.0f;
 constexpr int ROPE_ORIGINAL_MAX_LENGTH = 8192;
 constexpr float PI = 3.14159265358979323846f;
 
+// dog bites man
+// man bites dog
+// the cat sat on the mat
+// (xo, x1)
 cudaError_t initializeRopeTables(
     float **cos_table_gpu,
     float **sin_table_gpu,
@@ -73,7 +77,8 @@ cudaError_t initializeRopeTables(
     *sin_table_gpu = nullptr;
 
     std::vector<float> inverse_frequencies(ROPE_PAIRS_PER_HEAD);
-
+    // early pairs: fast freq
+    // later pairs = slow freq
     for (int pair = 0; pair < ROPE_PAIRS_PER_HEAD; ++pair)
     {
         inverse_frequencies[pair] =
@@ -238,12 +243,6 @@ __global__ void rmsNormKernel(
         __float2bfloat16(x1 * inverse_rms * weight1);
 }
 
-cudaError_t initializeRopeTables(
-    float **cos_table_gpu,
-    float **sin_table_gpu,
-    int max_sequence_length)
-{
-}
 __global__ void ropeKernel(
     __nv_bfloat16 *input,
     const int *position_ids,
