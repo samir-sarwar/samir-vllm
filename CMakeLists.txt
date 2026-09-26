@@ -20,7 +20,7 @@ add_executable(samir-vllm
 )
 
 target_include_directories(samir-vllm PRIVATE include)
-target_link_libraries(samir-vllm PRIVATE tokenizer CUDA::cudart)
+target_link_libraries(samir-vllm PRIVATE tokenizer CUDA::cudart CUDA::cublas)
 
 add_executable(tokenizer-test tests/tokenizer_test.cpp)
 target_link_libraries(tokenizer-test PRIVATE tokenizer)

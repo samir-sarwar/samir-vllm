@@ -54,7 +54,51 @@ int checkGPUStatus()
 }
 // 16 transformer layers.
 constexpr int N_LAYERS = 16;
+constexpr int HIDDEN_SIZE = 2048;
+constexpr int KV_DIM = 512;
+constexpr int HEAD_DIM = 64;
 
+// Computes:
+// output[token, output_feature] =
+//     sum(input[token, hidden] * weight[output_feature, hidden])
+//
+// All buffers are physically row-major. cuBLAS treats them as column-major,
+// so the dimensions and transpose flags below produce the desired row-major
+// result without explicitly transposing any GPU buffers.
+
+cublasStatus_t projectBf16RowMajor(
+    cublasHandle_t cublas_handle,
+    const __nv_bfloat16 *input,
+    const __nv_bfloat16 *weight,
+    __nv_bfloat16 *output,
+    int token_count,
+    int output_features)
+{
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    // C = alpha x A X B + beta x C
+
+    return cublasGemmEx(
+        cublas_handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        output_features,
+        token_count,
+        HIDDEN_SIZE,
+        &alpha,
+        weight,
+        CUDA_R_16BF,
+        HIDDEN_SIZE,
+        input,
+        CUDA_R_16BF,
+        HIDDEN_SIZE,
+        &beta,
+        output,
+        CUDA_R_16BF,
+        output_features,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+}
 struct LLamaWeights
 {
     // Generic pointer to start of gpu alloc.
@@ -391,6 +435,10 @@ int prefill(
     int *position_ids_gpu = nullptr;
     __nv_bfloat16 *activations_gpu = nullptr;
     __nv_bfloat16 *normalized_gpu = nullptr;
+    __nv_bfloat16 *q_gpu = nullptr;
+    __nv_bfloat16 *k_gpu = nullptr;
+    __nv_bfloat16 *v_gpu = nullptr;
+    cublasHandle_t cublas_handle = nullptr;
 
     auto free_prefill_buffers = [&]()
     {
@@ -398,6 +446,14 @@ int prefill(
         cudaFree(position_ids_gpu);
         cudaFree(activations_gpu);
         cudaFree(normalized_gpu);
+        if (cublas_handle != nullptr)
+        {
+            cublasDestroy(cublas_handle);
+        }
+
+        cudaFree(q_gpu);
+        cudaFree(k_gpu);
+        cudaFree(v_gpu);
     };
 
     if (cudaMalloc(&token_id_gpu, token_ids.size() * sizeof(int)) != 0)
@@ -487,8 +543,88 @@ int prefill(
         return -1;
     }
 
-    // position_ids_gpu and the RoPE tables are ready for Q and K once their
-    // projection buffers are added. RoPE must not be applied to normalized_gpu.
+    const size_t q_bytes =
+        static_cast<size_t>(token_count) *
+        HIDDEN_SIZE *
+        sizeof(__nv_bfloat16);
+
+    const size_t kv_bytes =
+        static_cast<size_t>(token_count) *
+        KV_DIM *
+        sizeof(__nv_bfloat16);
+
+    if (cudaMalloc(&q_gpu, q_bytes) != cudaSuccess ||
+        cudaMalloc(&k_gpu, kv_bytes) != cudaSuccess ||
+        cudaMalloc(&v_gpu, kv_bytes) != cudaSuccess)
+    {
+        std::cerr << "Q/K/V buffer allocation failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    if (cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "cuBLAS initialization failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    // This milestone only runs layer 0. Later, this becomes a loop over all layers.
+    constexpr int layer = 0;
+
+    const cublasStatus_t q_status = projectBf16RowMajor(
+        cublas_handle,
+        normalized_gpu,
+        weights.w_q[layer],
+        q_gpu,
+        token_count,
+        HIDDEN_SIZE);
+
+    const cublasStatus_t k_status = projectBf16RowMajor(
+        cublas_handle,
+        normalized_gpu,
+        weights.w_k[layer],
+        k_gpu,
+        token_count,
+        KV_DIM);
+
+    const cublasStatus_t v_status = projectBf16RowMajor(
+        cublas_handle,
+        normalized_gpu,
+        weights.w_v[layer],
+        v_gpu,
+        token_count,
+        KV_DIM);
+
+    if (q_status != CUBLAS_STATUS_SUCCESS ||
+        k_status != CUBLAS_STATUS_SUCCESS ||
+        v_status != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "Q/K/V projection failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    // Position belongs in the Q–K comparison, so rotate Q and K only.
+    if (launchRope(
+            q_gpu, position_ids_gpu, cos_table_gpu, sin_table_gpu,
+            token_count, HIDDEN_SIZE, HEAD_DIM) != cudaSuccess ||
+        launchRope(
+            k_gpu, position_ids_gpu, cos_table_gpu, sin_table_gpu,
+            token_count, KV_DIM, HEAD_DIM) != cudaSuccess)
+    {
+        std::cerr << "RoPE application to Q/K failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    if (cudaDeviceSynchronize() != cudaSuccess)
+    {
+        std::cerr << "Q/K/V projection or RoPE execution failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
     free_prefill_buffers();
     return 0;
 }
