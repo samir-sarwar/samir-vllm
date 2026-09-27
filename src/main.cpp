@@ -11,6 +11,7 @@
 #include <numeric>
 #include <unordered_map>
 #include <algorithm>
+#include <cmath>
 #include <vector>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -57,6 +58,13 @@ constexpr int N_LAYERS = 16;
 constexpr int HIDDEN_SIZE = 2048;
 constexpr int KV_DIM = 512;
 constexpr int HEAD_DIM = 64;
+constexpr int NUM_QUERY_HEADS = HIDDEN_SIZE / HEAD_DIM;
+constexpr int NUM_KV_HEADS = KV_DIM / HEAD_DIM;
+constexpr int QUERY_HEADS_PER_KV_HEAD = NUM_QUERY_HEADS / NUM_KV_HEADS;
+
+static_assert(HIDDEN_SIZE % HEAD_DIM == 0);
+static_assert(KV_DIM % HEAD_DIM == 0);
+static_assert(NUM_QUERY_HEADS % NUM_KV_HEADS == 0);
 
 // Computes:
 // output[token, output_feature] =
@@ -98,6 +106,150 @@ cublasStatus_t projectBf16RowMajor(
         output_features,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT);
+}
+// hidden state
+// RMSNORM
+// Q,K,V Projection
+// RoPE on Q and K
+// Scaled QK Attention scores
+// causa mask
+// stable softmax
+// attention weights multiplied by W_v
+// output projection
+// residual
+
+// score[i,j] = Q[i] . K[j]
+
+// Builds attention scores in [query_head, query_token, key_token] layout.
+// Four consecutive Q heads share one K head in this Llama GQA configuration.
+cublasStatus_t computeGqaAttentionScores(
+    cublasHandle_t cublas_handle,
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k,
+    __nv_bfloat16 *scores,
+    int token_count)
+{
+    if (cublas_handle == nullptr || q == nullptr || k == nullptr ||
+        scores == nullptr || token_count <= 0)
+    {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+
+    const float alpha = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+    const float beta = 0.0f;
+    const size_t scores_per_head =
+        static_cast<size_t>(token_count) * token_count;
+
+    for (int query_head_index = 0;
+         query_head_index < NUM_QUERY_HEADS;
+         ++query_head_index)
+    {
+        const int kv_head_index =
+            query_head_index / QUERY_HEADS_PER_KV_HEAD;
+
+        // q_head and k_head retain their full row strides. cuBLAS's
+        // column-major interpretation therefore produces K x Q^T, which is
+        // the row-major storage of Q x K^T.
+        const __nv_bfloat16 *q_head =
+            q + query_head_index * HEAD_DIM;
+        const __nv_bfloat16 *k_head =
+            k + kv_head_index * HEAD_DIM;
+        __nv_bfloat16 *score_head =
+            scores + query_head_index * scores_per_head;
+
+        const cublasStatus_t status = cublasGemmEx(
+            cublas_handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            token_count,
+            token_count,
+            HEAD_DIM,
+            &alpha,
+            k_head,
+            CUDA_R_16BF,
+            KV_DIM,
+            q_head,
+            CUDA_R_16BF,
+            HIDDEN_SIZE,
+            &beta,
+            score_head,
+            CUDA_R_16BF,
+            token_count,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+            return status;
+        }
+    }
+
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+// Multiplies each Q head's probability matrix by its shared V head. The
+// concatenated result is [token, 32 * 64], or [token, HIDDEN_SIZE].
+cublasStatus_t mixGqaValues(
+    cublasHandle_t cublas_handle,
+    const __nv_bfloat16 *probabilities,
+    const __nv_bfloat16 *v,
+    __nv_bfloat16 *attention_output,
+    int token_count)
+{
+    if (cublas_handle == nullptr || probabilities == nullptr || v == nullptr ||
+        attention_output == nullptr || token_count <= 0)
+    {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const size_t scores_per_head =
+        static_cast<size_t>(token_count) * token_count;
+
+    for (int query_head_index = 0;
+         query_head_index < NUM_QUERY_HEADS;
+         ++query_head_index)
+    {
+        const int kv_head_index =
+            query_head_index / QUERY_HEADS_PER_KV_HEAD;
+        const __nv_bfloat16 *probability_head =
+            probabilities + query_head_index * scores_per_head;
+        const __nv_bfloat16 *value_head =
+            v + kv_head_index * HEAD_DIM;
+        __nv_bfloat16 *output_head =
+            attention_output + query_head_index * HEAD_DIM;
+
+        // This produces V^T x probabilities^T in cuBLAS's column-major view,
+        // which is the row-major storage of probabilities x V.
+        const cublasStatus_t status = cublasGemmEx(
+            cublas_handle,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            HEAD_DIM,
+            token_count,
+            token_count,
+            &alpha,
+            value_head,
+            CUDA_R_16BF,
+            KV_DIM,
+            probability_head,
+            CUDA_R_16BF,
+            token_count,
+            &beta,
+            output_head,
+            CUDA_R_16BF,
+            HIDDEN_SIZE,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+            return status;
+        }
+    }
+
+    return CUBLAS_STATUS_SUCCESS;
 }
 struct LLamaWeights
 {
@@ -438,6 +590,9 @@ int prefill(
     __nv_bfloat16 *q_gpu = nullptr;
     __nv_bfloat16 *k_gpu = nullptr;
     __nv_bfloat16 *v_gpu = nullptr;
+    __nv_bfloat16 *attention_scores_gpu = nullptr;
+    __nv_bfloat16 *attention_output_gpu = nullptr;
+    __nv_bfloat16 *output_projection_gpu = nullptr;
     cublasHandle_t cublas_handle = nullptr;
 
     auto free_prefill_buffers = [&]()
@@ -454,6 +609,9 @@ int prefill(
         cudaFree(q_gpu);
         cudaFree(k_gpu);
         cudaFree(v_gpu);
+        cudaFree(attention_scores_gpu);
+        cudaFree(attention_output_gpu);
+        cudaFree(output_projection_gpu);
     };
 
     if (cudaMalloc(&token_id_gpu, token_ids.size() * sizeof(int)) != 0)
@@ -621,6 +779,98 @@ int prefill(
     if (cudaDeviceSynchronize() != cudaSuccess)
     {
         std::cerr << "Q/K/V projection or RoPE execution failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    // GQA keeps 32 query heads but shares 8 key/value heads. Scores are
+    // [query_head, query_token, key_token], so each Q head has one T x T
+    // matrix and maps to KV head query_head / 4.
+    const size_t attention_score_bytes =
+        static_cast<size_t>(NUM_QUERY_HEADS) *
+        token_count *
+        token_count *
+        sizeof(__nv_bfloat16);
+
+    if (cudaMalloc(&attention_scores_gpu, attention_score_bytes) != cudaSuccess ||
+        cudaMalloc(&attention_output_gpu, activation_bytes) != cudaSuccess ||
+        cudaMalloc(&output_projection_gpu, activation_bytes) != cudaSuccess)
+    {
+        std::cerr << "attention buffer allocation failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    if (computeGqaAttentionScores(
+            cublas_handle,
+            q_gpu,
+            k_gpu,
+            attention_scores_gpu,
+            token_count) != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "GQA score projection failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    // Prevent future tokens from influencing the current token, then turn
+    // every score row into a stable probability distribution.
+    if (launchCausalMask(
+            attention_scores_gpu,
+            token_count,
+            NUM_QUERY_HEADS) != cudaSuccess ||
+        launchStableSoftmax(
+            attention_scores_gpu,
+            token_count,
+            NUM_QUERY_HEADS) != cudaSuccess)
+    {
+        std::cerr << "causal mask or stable softmax launch failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    if (mixGqaValues(
+            cublas_handle,
+            attention_scores_gpu,
+            v_gpu,
+            attention_output_gpu,
+            token_count) != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "GQA value mixing failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    if (projectBf16RowMajor(
+            cublas_handle,
+            attention_output_gpu,
+            weights.w_o[layer],
+            output_projection_gpu,
+            token_count,
+            HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "attention output projection failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    if (launchResidualAdd(
+            activations_gpu,
+            output_projection_gpu,
+            token_count,
+            HIDDEN_SIZE) != cudaSuccess)
+    {
+        std::cerr << "attention residual launch failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    execution_error = cudaDeviceSynchronize();
+    if (execution_error != cudaSuccess)
+    {
+        std::cerr << "attention execution failed: "
+                  << cudaGetErrorString(execution_error)
+                  << '\n';
         free_prefill_buffers();
         return -1;
     }

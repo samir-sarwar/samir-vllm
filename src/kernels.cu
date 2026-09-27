@@ -298,6 +298,128 @@ __global__ void ropeKernel(
         __float2bfloat16(x0 * sine + x1 * cosine);
 }
 
+// scores is [query_head, query_token, key_token]. A score above the diagonal
+// would let a token see the future, so it must never participate in softmax.
+__global__ void causalMaskKernel(
+    __nv_bfloat16 *scores,
+    int token_count,
+    int num_query_heads)
+{
+    const size_t score_index =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t score_count =
+        static_cast<size_t>(num_query_heads) *
+        token_count *
+        token_count;
+
+    if (score_index >= score_count)
+    {
+        return;
+    }
+
+    const int key_token = score_index % token_count;
+    const int query_token =
+        (score_index / token_count) % token_count;
+
+    if (key_token > query_token)
+    {
+        scores[score_index] = __float2bfloat16(-CUDART_INF_F);
+    }
+}
+
+// Each block normalizes one [query_head, query_token] row. Threads stride over
+// key positions, which keeps this valid for contexts longer than one CUDA block.
+__global__ void stableSoftmaxKernel(
+    __nv_bfloat16 *scores,
+    int token_count)
+{
+    constexpr int THREADS_PER_BLOCK = 256;
+    __shared__ float reductions[THREADS_PER_BLOCK];
+
+    const int thread_index = threadIdx.x;
+    const size_t row_start =
+        static_cast<size_t>(blockIdx.x) * token_count;
+
+    float local_max = -CUDART_INF_F;
+    for (int key_token = thread_index;
+         key_token < token_count;
+         key_token += THREADS_PER_BLOCK)
+    {
+        local_max = fmaxf(
+            local_max,
+            __bfloat162float(scores[row_start + key_token]));
+    }
+
+    reductions[thread_index] = local_max;
+    __syncthreads();
+
+    for (int stride = THREADS_PER_BLOCK / 2;
+         stride > 0;
+         stride >>= 1)
+    {
+        if (thread_index < stride)
+        {
+            reductions[thread_index] = fmaxf(
+                reductions[thread_index],
+                reductions[thread_index + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float row_max = reductions[0];
+    float local_sum = 0.0f;
+    for (int key_token = thread_index;
+         key_token < token_count;
+         key_token += THREADS_PER_BLOCK)
+    {
+        local_sum += expf(
+            __bfloat162float(scores[row_start + key_token]) - row_max);
+    }
+
+    reductions[thread_index] = local_sum;
+    __syncthreads();
+
+    for (int stride = THREADS_PER_BLOCK / 2;
+         stride > 0;
+         stride >>= 1)
+    {
+        if (thread_index < stride)
+        {
+            reductions[thread_index] += reductions[thread_index + stride];
+        }
+        __syncthreads();
+    }
+
+    const float inverse_sum = 1.0f / reductions[0];
+    for (int key_token = thread_index;
+         key_token < token_count;
+         key_token += THREADS_PER_BLOCK)
+    {
+        const float probability = expf(
+            __bfloat162float(scores[row_start + key_token]) - row_max) *
+            inverse_sum;
+        scores[row_start + key_token] = __float2bfloat16(probability);
+    }
+}
+
+__global__ void residualAddKernel(
+    __nv_bfloat16 *hidden_state,
+    const __nv_bfloat16 *update,
+    size_t value_count)
+{
+    const size_t value_index =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+    if (value_index >= value_count)
+    {
+        return;
+    }
+
+    hidden_state[value_index] = __float2bfloat16(
+        __bfloat162float(hidden_state[value_index]) +
+        __bfloat162float(update[value_index]));
+}
+
 /* -------------- Kernel Launchers -------------- */
 cudaError_t launchEmbeddingGather(
     const int *token_id_gpu,
@@ -386,6 +508,92 @@ cudaError_t launchRope(
         token_count,
         projection_size,
         head_size);
+
+    return cudaGetLastError();
+}
+
+cudaError_t launchCausalMask(
+    __nv_bfloat16 *scores,
+    int token_count,
+    int num_query_heads)
+{
+    if (token_count == 0)
+    {
+        return cudaSuccess;
+    }
+
+    if (scores == nullptr || token_count < 0 || num_query_heads <= 0)
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr int THREADS_PER_BLOCK = 256;
+    const size_t score_count =
+        static_cast<size_t>(num_query_heads) *
+        token_count *
+        token_count;
+    const size_t block_count =
+        (score_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    causalMaskKernel<<<block_count, THREADS_PER_BLOCK>>>(
+        scores,
+        token_count,
+        num_query_heads);
+
+    return cudaGetLastError();
+}
+
+cudaError_t launchStableSoftmax(
+    __nv_bfloat16 *scores,
+    int token_count,
+    int num_query_heads)
+{
+    if (token_count == 0)
+    {
+        return cudaSuccess;
+    }
+
+    if (scores == nullptr || token_count < 0 || num_query_heads <= 0)
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr int THREADS_PER_BLOCK = 256;
+    const int row_count = num_query_heads * token_count;
+    stableSoftmaxKernel<<<row_count, THREADS_PER_BLOCK>>>(
+        scores,
+        token_count);
+
+    return cudaGetLastError();
+}
+
+cudaError_t launchResidualAdd(
+    __nv_bfloat16 *hidden_state,
+    const __nv_bfloat16 *update,
+    int token_count,
+    int hidden_size)
+{
+    if (token_count == 0)
+    {
+        return cudaSuccess;
+    }
+
+    if (hidden_state == nullptr || update == nullptr ||
+        token_count < 0 || hidden_size <= 0)
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr int THREADS_PER_BLOCK = 256;
+    const size_t value_count =
+        static_cast<size_t>(token_count) * hidden_size;
+    const size_t block_count =
+        (value_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    residualAddKernel<<<block_count, THREADS_PER_BLOCK>>>(
+        hidden_state,
+        update,
+        value_count);
 
     return cudaGetLastError();
 }

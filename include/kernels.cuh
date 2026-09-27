@@ -29,3 +29,24 @@ cudaError_t launchRope(
     int token_count,
     int projection_size,
     int head_size);
+
+// Sets all future-token attention scores to negative infinity in-place.
+// scores is laid out as [query_head, query_token, key_token].
+cudaError_t launchCausalMask(
+    __nv_bfloat16 *scores,
+    int token_count,
+    int num_query_heads);
+
+// Applies a numerically stable softmax over the key-token dimension in-place.
+// scores is laid out as [query_head, query_token, key_token].
+cudaError_t launchStableSoftmax(
+    __nv_bfloat16 *scores,
+    int token_count,
+    int num_query_heads);
+
+// Adds update to hidden_state in-place. Both buffers are [token, hidden].
+cudaError_t launchResidualAdd(
+    __nv_bfloat16 *hidden_state,
+    const __nv_bfloat16 *update,
+    int token_count,
+    int hidden_size);
