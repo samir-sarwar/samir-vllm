@@ -66,7 +66,7 @@ launchRmsNorm(
     token_count);
 ```
 
-`weights.input_layernorm[0]` points into the big weight allocation loaded at startup. It is a vector of 2,048 BF16 learned values. We do not copy the weights again for this prompt. The `0` matters: the current `prefill` stops after the **first** layer's input norm. Later, a full forward pass would loop over all 16 layers and use the corresponding vector each time.
+`weights.input_layernorm[0]` points into the big weight allocation loaded at startup. It is a vector of 2,048 BF16 learned values. We do not copy the weights again for this prompt. The `0` matters: this video works with the **first** layer's input norm. The current code continues into attention for layer 0, while a full forward pass would loop over all 16 layers and use the corresponding norm vector each time.
 
 ## The CUDA mapping: one block per token
 
@@ -167,7 +167,7 @@ Notice the two meanings of "weight" here. `activations_gpu` holds prompt-depende
 
 ## What this code does today, and what comes next
 
-The kernel is reusable for any token count with this fixed 2,048 hidden width. In the current checkout, `prefill` calls it only for layer 0's first norm and then frees the temporary activation buffers. No Q/K/V projection or next-token prediction follows yet. Eventually the normalized output should feed the layer's attention projections, then the rest of the Transformer block.
+The kernel is reusable for any token count with this fixed 2,048 hidden width. At this video's milestone, `prefill` called it only for layer 0's first norm; Q/K/V projection was the next step. The later [Q/K/V notes](youtubePT6_qkv_projection_notes.md) show how the current code uses `normalized_gpu` as that projection input. The engine still does not produce a next-token prediction.
 
 The thing to keep in mind from this video:
 

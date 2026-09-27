@@ -17,7 +17,7 @@ text prompt
   -> choose next token ID -> tokenizer decode -> text
 ```
 
-The current checkout only implements the beginning of that trip. It loads weights, tokenizes a prompt, gathers embeddings, runs the first RMSNorm, and prepares RoPE tables. It does not yet produce a next-token answer. When I describe the full path below, that's the model we're building toward, not a claim that `src/main.cpp` already runs it all.
+The code now reaches the end of layer 0's self-attention sublayer: it loads weights, tokenizes a prompt, gathers embeddings, runs RMSNorm and Q/K/V projections, applies RoPE, computes masked attention, and adds the attention residual. It does not yet run the MLP, all 16 layers, or produce a next-token answer. When I describe the full path below, that's the model we're building toward, not a claim that `src/main.cpp` already runs it all.
 
 ## Wtf is inference?
 
@@ -95,7 +95,7 @@ Two phases will matter later:
 - **Prefill**: run the whole prompt through the model, with causal attention, to establish hidden states and cache the K/V values for its positions.
 - **Decode**: append one new token and run enough work to predict the next one, reusing the prior K/V cache rather than recomputing the whole prompt each time.
 
-Why a **causal** mask? When predicting the next token, a position should only use tokens at that position or earlier. It must not peek into the future text. The current `prefill` function is an early scaffold: it gathers embeddings and runs layer 0's first RMSNorm; it has no attention or KV cache yet.
+Why a **causal** mask? When predicting the next token, a position should only use tokens at that position or earlier. It must not peek into the future text. The current `prefill` function computes layer 0's attention for the prompt, but it does not yet retain K/V in a cache for later decode.
 
 ## The main distinction to remember
 

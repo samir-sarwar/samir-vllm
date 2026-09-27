@@ -8,7 +8,7 @@ An embedding lookup gives the same learned starting row to a token ID wherever i
 
 Without positional information, attention based only on content has no built-in way to distinguish a simultaneous rearrangement of tokens. In a causal model, the mask and order of processing already matter, but the attention mechanism still benefits from a direct signal about positions. RoPE supplies that signal to attention by rotating **query and key activations** according to their token positions.
 
-The order in the layer will eventually be:
+The order in the attention sublayer is:
 
 ```text
 hidden states
@@ -19,7 +19,7 @@ hidden states
   -> weighted sum of V
 ```
 
-That last distinction is important. We do not rotate the learned `w_q` and `w_k` **weights** from the SafeTensors file. We rotate the prompt-dependent **Q and K vectors produced by those weights**. The current repository has the RoPE table builder and kernel, but does not yet create Q/K projection buffers or call `launchRope` from `prefill`.
+That last distinction is important. We do not rotate the learned `w_q` and `w_k` **weights** from the SafeTensors file. We rotate the prompt-dependent **Q and K vectors produced by those weights**. At this video's milestone the RoPE table builder and kernel were ready, but `prefill` did not yet create Q/K projection buffers or call `launchRope`. The later [Q/K/V notes](youtubePT6_qkv_projection_notes.md) show that connection.
 
 ## The two-number picture
 
@@ -205,11 +205,11 @@ input[second_index] = __float2bfloat16(x0 * sine + x1 * cosine);
 
 The FP32 intermediate helps precision in the multiply/add steps. The output is rounded to BF16 because that is this engine's activation format. No other thread writes this pair, so there is no block-wide barrier like RMSNorm needed.
 
-## What the host has prepared, and the missing connection
+## How the host connects RoPE to Q and K
 
-`main` calls `initializeRopeTables` with a 2,048-position limit. `prefill` builds zero-based `position_ids_cpu`, copies them to `position_ids_gpu`, gathers embeddings, and runs the first RMSNorm. That is as far as the current executable goes. The RoPE tables and position IDs are ready, and the kernel can rotate a Q or K buffer once one exists, but **`prefill` does not call `launchRope` yet**. Applying RoPE to `normalized_gpu` would be wrong: it needs to act on the Q and K projection outputs, separately, with their respective projection widths.
+`main` calls `initializeRopeTables` with a 2,048-position limit. `prefill` builds zero-based `position_ids_cpu`, copies them to `position_ids_gpu`, gathers embeddings, and runs the first RMSNorm. At the Part 4 milestone, the RoPE tables and position IDs were ready but `prefill` did not yet call `launchRope`. The current code now applies it to the separate Q and K projection outputs with their respective projection widths. Applying RoPE to `normalized_gpu` would be wrong.
 
-When those projections are connected, the mental model is:
+With those projections connected, the mental model is:
 
 ```text
 for each token and each Q/K head:
