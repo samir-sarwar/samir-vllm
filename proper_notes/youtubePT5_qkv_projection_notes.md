@@ -1,4 +1,4 @@
-# Q, K, V Projection with cuBLAS — Part 6 Video Notes
+# Q, K, V Projection with cuBLAS — Part 5 Video Notes
 
 Video: [Computing Query, Key, Value vectors using cuBLAS](https://youtu.be/8_HJH7pbw78). Keep [`projectBf16RowMajor` and `prefill` in `src/main.cpp`](../src/main.cpp) open while reading. [RMSNorm](youtubePT3_rmsnorm_notes.md) explains where the input comes from; [RoPE](youtubePT4_rope_notes.md) explains what happens to Q and K afterward.
 
@@ -133,7 +133,7 @@ So the actual call uses `CUBLAS_OP_T`, `CUBLAS_OP_N`, and `(m, n, k) = (O, T, 20
 
 After the three projections, `prefill` calls `launchRope` on `q_gpu` with projection width `2048`, and on `k_gpu` with width `512`. Both use head width `64`, the position IDs, and the precomputed sine/cosine tables. `v_gpu` is left alone. RoPE changes Q/K **activations in place**, so the later Q·K comparisons contain relative-position information.
 
-The host checks cuBLAS return statuses and CUDA launch errors, then synchronizes to catch GPU execution errors. `q_gpu`, `k_gpu`, and `v_gpu` are temporary buffers in this prefill path; they are freed before the function returns. In the current checkout, their next consumer is the layer-0 self-attention code described in [the self-attention notes](self_attention_completion_notes.md).
+The host checks cuBLAS return statuses and CUDA launch errors, then synchronizes to catch GPU execution errors. `q_gpu`, `k_gpu`, and `v_gpu` are temporary buffers in this prefill path; they are freed before the function returns. In the current checkout, their next consumer is the layer-0 self-attention code described in [the self-attention notes](youtubePT7_self_attention_completion.md).
 
 ## What to keep straight while watching
 

@@ -4,7 +4,7 @@ Video: [AI inference as simply as possible](https://youtu.be/ef0mOukUE6U). These
 
 ## What am I doing?
 
-I'm building a small LLM inference engine with C++ and CUDA, inspired by vLLM and the [tiny-vllm course](https://github.com/jmaczan/tiny-vllm). The goal is to understand what actually happens between typing a prompt and receiving the next token. This project targets one particular model, Llama 3.2 1B Instruct; it is not a general vLLM replacement.
+I'm building a small LLM inference engine with C++ and CUDA to explain what happens between typing a prompt and receiving the next token. This project targets one particular model, Llama 3.2 1B Instruct; it is not a general vLLM replacement.
 
 Here is the whole trip before we zoom in:
 
@@ -86,7 +86,7 @@ token IDs [T]
 
 `T` is the number of prompt tokens. `128256` is the vocabulary size, and `2048` is the hidden-vector width. Each decoder layer updates those hidden vectors. The operations are *not* interchangeable: RMSNorm, Q/K/V projections, RoPE, masked attention, residual additions, and the MLP must run in the model's intended order. [Part 1](youtubePT1_notes.md) has the architecture and weight names; [Part 2](youtubePT2_embedding_gather_notes.md) shows the first actual GPU operation.
 
-There is a subtle point about the last step. The model produces **logits**, which are scores, not already-selected words. Greedy decoding takes the largest logit with `argmax`; other sampling strategies may choose differently. The full tiny-vllm reference uses greedy selection. This checkout has not connected that output path yet.
+There is a subtle point about the last step. The model produces **logits**, which are scores, not already-selected words. Greedy decoding takes the largest logit with `argmax`; other sampling strategies may choose differently. This checkout has not connected that output path yet.
 
 ## Prompt processing and generating the next token
 

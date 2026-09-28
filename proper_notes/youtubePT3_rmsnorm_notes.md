@@ -167,7 +167,7 @@ Notice the two meanings of "weight" here. `activations_gpu` holds prompt-depende
 
 ## What this code does today, and what comes next
 
-The kernel is reusable for any token count with this fixed 2,048 hidden width. At this video's milestone, `prefill` called it only for layer 0's first norm; Q/K/V projection was the next step. The later [Q/K/V notes](youtubePT6_qkv_projection_notes.md) show how the current code uses `normalized_gpu` as that projection input. The engine still does not produce a next-token prediction.
+The kernel is reusable for any token count with this fixed 2,048 hidden width. At this video's milestone, `prefill` called it only for layer 0's first norm; Q/K/V projection was the next step. The later [Q/K/V notes](youtubePT5_qkv_projection_notes.md) show how the current code uses `normalized_gpu` as that projection input. The engine still does not produce a next-token prediction.
 
 The thing to keep in mind from this video:
 

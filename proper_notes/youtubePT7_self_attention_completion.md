@@ -1,6 +1,6 @@
 # Finishing the Self-Attention Sublayer — Code Notes for the Upcoming Video
 
-This video has not been published yet. These notes follow the latest layer-0 attention implementation in [`src/main.cpp`](../src/main.cpp) and [`src/kernels.cu`](../src/kernels.cu), and the “Attention” section of [`notes.md`](../notes.md). Start with [the Q/K/V projection notes](youtubePT6_qkv_projection_notes.md) if the three projected buffers are still unfamiliar.
+This video has not been published yet. These notes follow the latest layer-0 attention implementation in [`src/main.cpp`](../src/main.cpp) and [`src/kernels.cu`](../src/kernels.cu), and the “Attention” section of [`notes.md`](../notes.md). Start with [the Q/K/V projection notes](youtubePT5_qkv_projection_notes.md) if the three projected buffers are still unfamiliar.
 
 ## What we are finishing
 

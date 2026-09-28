@@ -19,7 +19,7 @@ hidden states
   -> weighted sum of V
 ```
 
-That last distinction is important. We do not rotate the learned `w_q` and `w_k` **weights** from the SafeTensors file. We rotate the prompt-dependent **Q and K vectors produced by those weights**. At this video's milestone the RoPE table builder and kernel were ready, but `prefill` did not yet create Q/K projection buffers or call `launchRope`. The later [Q/K/V notes](youtubePT6_qkv_projection_notes.md) show that connection.
+That last distinction is important. We do not rotate the learned `w_q` and `w_k` **weights** from the SafeTensors file. We rotate the prompt-dependent **Q and K vectors produced by those weights**. At this video's milestone the RoPE table builder and kernel were ready, but `prefill` did not yet create Q/K projection buffers or call `launchRope`. The later [Q/K/V notes](youtubePT5_qkv_projection_notes.md) show that connection.
 
 ## The two-number picture
 
