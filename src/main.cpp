@@ -57,6 +57,9 @@ int checkGPUStatus()
 constexpr int N_LAYERS = 16;
 constexpr int HIDDEN_SIZE = 2048;
 constexpr int KV_DIM = 512;
+constexpr int INTERMEDIATE_SIZE = 8192;
+constexpr int VOCAB_SIZE = 128256;
+constexpr int MAX_SEQUENCE_LENGTH = 2048;
 constexpr int HEAD_DIM = 64;
 constexpr int NUM_QUERY_HEADS = HIDDEN_SIZE / HEAD_DIM;
 constexpr int NUM_KV_HEADS = KV_DIM / HEAD_DIM;
@@ -68,7 +71,7 @@ static_assert(NUM_QUERY_HEADS % NUM_KV_HEADS == 0);
 
 // Computes:
 // output[token, output_feature] =
-//     sum(input[token, hidden] * weight[output_feature, hidden])
+//     sum(input[token, input_feature] * weight[output_feature, input_feature])
 //
 // All buffers are physically row-major. cuBLAS treats them as column-major,
 // so the dimensions and transpose flags below produce the desired row-major
@@ -80,6 +83,7 @@ cublasStatus_t projectBf16RowMajor(
     const __nv_bfloat16 *weight,
     __nv_bfloat16 *output,
     int token_count,
+    int input_features,
     int output_features)
 {
     const float alpha = 1.0f;
@@ -92,14 +96,14 @@ cublasStatus_t projectBf16RowMajor(
         CUBLAS_OP_N,
         output_features,
         token_count,
-        HIDDEN_SIZE,
+        input_features,
         &alpha,
         weight,
         CUDA_R_16BF,
-        HIDDEN_SIZE,
+        input_features,
         input,
         CUDA_R_16BF,
-        HIDDEN_SIZE,
+        input_features,
         &beta,
         output,
         CUDA_R_16BF,
@@ -107,12 +111,13 @@ cublasStatus_t projectBf16RowMajor(
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT);
 }
+// Attention path (repeated for each layer):
 // hidden state
 // RMSNORM
 // Q,K,V Projection
 // RoPE on Q and K
 // Scaled QK Attention scores
-// causa mask
+// causal mask
 // stable softmax
 // attention weights multiplied by W_v
 // output projection
@@ -258,6 +263,8 @@ struct LLamaWeights
 
     // Ptr to embedding table, of bf16 vectors.
     __nv_bfloat16 *embed_tokens = nullptr;
+    // Llama 3.2 1B normally ties this to the embedding table.
+    __nv_bfloat16 *lm_head = nullptr;
     // Final rmsnorm weight vector.
     __nv_bfloat16 *norm = nullptr;
 
@@ -302,7 +309,9 @@ int loadLlamaModel(LLamaWeights &weights)
         std::cerr << "could not read safetensors file";
         return -1;
     }
+#ifdef DEBUG
     std::cout << headersize << '\n';
+#endif
     // The next headersize bytes of the file contain the json header which
     // describes all tensors. We use each tensor's data_offsets values to create
     // pointers later, then allocate max_offset bytes of memory on the GPU.
@@ -316,7 +325,9 @@ int loadLlamaModel(LLamaWeights &weights)
     // Convert this bigass string into a json object.
     json header_json = json::parse(header);
 
+#ifdef DEBUG
     std::cout << header_json;
+#endif
 
     // The way we are going to store tensor -> starting byte offset is by using
     // a hashmap.
@@ -386,6 +397,9 @@ int loadLlamaModel(LLamaWeights &weights)
 
     weights.embed_tokens = reinterpret_cast<__nv_bfloat16 *>(
         base + offsets.at("model.embed_tokens.weight"));
+    weights.lm_head = offsets.count("lm_head.weight") != 0
+                          ? reinterpret_cast<__nv_bfloat16 *>(base + offsets.at("lm_head.weight"))
+                          : weights.embed_tokens;
 
     weights.norm = reinterpret_cast<__nv_bfloat16 *>(base + offsets.at("model.norm.weight"));
     // Must wire pointers to 2 rmsnorm vectors, four attention matrices, and 3
@@ -525,6 +539,9 @@ int loadModelMmap(LLamaWeights &weights)
 
     weights.embed_tokens = reinterpret_cast<__nv_bfloat16 *>(
         base + offsets.at("model.embed_tokens.weight"));
+    weights.lm_head = offsets.count("lm_head.weight") != 0
+                          ? reinterpret_cast<__nv_bfloat16 *>(base + offsets.at("lm_head.weight"))
+                          : weights.embed_tokens;
 
     weights.norm = reinterpret_cast<__nv_bfloat16 *>(base + offsets.at("model.norm.weight"));
     // Must wire pointers to 2 rmsnorm vectors, four attention matrices, and 3
@@ -559,11 +576,8 @@ int loadModelMmap(LLamaWeights &weights)
     return 0;
 }
 
-std::vector<int> tokenize(Tokenizer &tokenizer)
+std::vector<int> tokenize(Tokenizer &tokenizer, const std::string &prompt)
 {
-    std::string prompt;
-    // std::cin >> prompt;
-    prompt = "Hello World! "; // temporary hardcoded prompt
     std::vector<int> token_ids = tokenizer.encode(prompt);
     return token_ids;
 }
@@ -572,9 +586,11 @@ int prefill(
     const std::vector<int> &token_ids,
     LLamaWeights &weights,
     const float *cos_table_gpu,
-    const float *sin_table_gpu)
+    const float *sin_table_gpu,
+    int &next_token_id)
 {
     if (token_ids.empty() ||
+        token_ids.size() > MAX_SEQUENCE_LENGTH ||
         cos_table_gpu == nullptr ||
         sin_table_gpu == nullptr)
     {
@@ -593,6 +609,10 @@ int prefill(
     __nv_bfloat16 *attention_scores_gpu = nullptr;
     __nv_bfloat16 *attention_output_gpu = nullptr;
     __nv_bfloat16 *output_projection_gpu = nullptr;
+    __nv_bfloat16 *gate_gpu = nullptr;
+    __nv_bfloat16 *up_gpu = nullptr;
+    float *logits_gpu = nullptr;
+    int *next_token_gpu = nullptr;
     cublasHandle_t cublas_handle = nullptr;
 
     auto free_prefill_buffers = [&]()
@@ -612,6 +632,10 @@ int prefill(
         cudaFree(attention_scores_gpu);
         cudaFree(attention_output_gpu);
         cudaFree(output_projection_gpu);
+        cudaFree(gate_gpu);
+        cudaFree(up_gpu);
+        cudaFree(logits_gpu);
+        cudaFree(next_token_gpu);
     };
 
     if (cudaMalloc(&token_id_gpu, token_ids.size() * sizeof(int)) != 0)
@@ -679,10 +703,26 @@ int prefill(
         return -1;
     }
 
+    // Scratch buffers are reused by every layer.
+    const size_t mlp_bytes =
+        static_cast<size_t>(token_count) *
+        INTERMEDIATE_SIZE *
+        sizeof(__nv_bfloat16);
+    if (cudaMalloc(&gate_gpu, mlp_bytes) != cudaSuccess ||
+        cudaMalloc(&up_gpu, mlp_bytes) != cudaSuccess)
+    {
+        std::cerr << "MLP buffer allocation failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    // Each layer starts with its own input norm and finishes with its MLP residual.
+    for (int layer = 0; layer < N_LAYERS; ++layer)
+    {
     if (launchRmsNorm(
             activations_gpu,
             normalized_gpu,
-            weights.input_layernorm[0],
+            weights.input_layernorm[layer],
             token_count) != cudaSuccess)
     {
         std::cerr << "RMSNorm kernel launch failed\n";
@@ -711,24 +751,23 @@ int prefill(
         KV_DIM *
         sizeof(__nv_bfloat16);
 
-    if (cudaMalloc(&q_gpu, q_bytes) != cudaSuccess ||
-        cudaMalloc(&k_gpu, kv_bytes) != cudaSuccess ||
-        cudaMalloc(&v_gpu, kv_bytes) != cudaSuccess)
+    // Create Q/K/V buffers and the cuBLAS handle once, then reuse them.
+    if (layer == 0 &&
+        (cudaMalloc(&q_gpu, q_bytes) != cudaSuccess ||
+         cudaMalloc(&k_gpu, kv_bytes) != cudaSuccess ||
+         cudaMalloc(&v_gpu, kv_bytes) != cudaSuccess))
     {
         std::cerr << "Q/K/V buffer allocation failed\n";
         free_prefill_buffers();
         return -1;
     }
 
-    if (cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
+    if (layer == 0 && cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
     {
         std::cerr << "cuBLAS initialization failed\n";
         free_prefill_buffers();
         return -1;
     }
-
-    // This milestone only runs layer 0. Later, this becomes a loop over all layers.
-    constexpr int layer = 0;
 
     const cublasStatus_t q_status = projectBf16RowMajor(
         cublas_handle,
@@ -736,6 +775,7 @@ int prefill(
         weights.w_q[layer],
         q_gpu,
         token_count,
+        HIDDEN_SIZE,
         HIDDEN_SIZE);
 
     const cublasStatus_t k_status = projectBf16RowMajor(
@@ -744,6 +784,7 @@ int prefill(
         weights.w_k[layer],
         k_gpu,
         token_count,
+        HIDDEN_SIZE,
         KV_DIM);
 
     const cublasStatus_t v_status = projectBf16RowMajor(
@@ -752,6 +793,7 @@ int prefill(
         weights.w_v[layer],
         v_gpu,
         token_count,
+        HIDDEN_SIZE,
         KV_DIM);
 
     if (q_status != CUBLAS_STATUS_SUCCESS ||
@@ -792,9 +834,11 @@ int prefill(
         token_count *
         sizeof(__nv_bfloat16);
 
-    if (cudaMalloc(&attention_scores_gpu, attention_score_bytes) != cudaSuccess ||
-        cudaMalloc(&attention_output_gpu, activation_bytes) != cudaSuccess ||
-        cudaMalloc(&output_projection_gpu, activation_bytes) != cudaSuccess)
+    // Attention scratch has the same shape in every layer.
+    if (layer == 0 &&
+        (cudaMalloc(&attention_scores_gpu, attention_score_bytes) != cudaSuccess ||
+         cudaMalloc(&attention_output_gpu, activation_bytes) != cudaSuccess ||
+         cudaMalloc(&output_projection_gpu, activation_bytes) != cudaSuccess))
     {
         std::cerr << "attention buffer allocation failed\n";
         free_prefill_buffers();
@@ -847,6 +891,7 @@ int prefill(
             weights.w_o[layer],
             output_projection_gpu,
             token_count,
+            HIDDEN_SIZE,
             HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS)
     {
         std::cerr << "attention output projection failed\n";
@@ -875,23 +920,129 @@ int prefill(
         return -1;
     }
 
+    // The second norm feeds two parallel 8192-wide projections.
+    if (launchRmsNorm(
+            activations_gpu,
+            normalized_gpu,
+            weights.post_attn_layernorms[layer],
+            token_count) != cudaSuccess)
+    {
+        std::cerr << "post-attention RMSNorm launch failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    const cublasStatus_t gate_status = projectBf16RowMajor(
+        cublas_handle,
+        normalized_gpu,
+        weights.mlp_gate_proj[layer],
+        gate_gpu,
+        token_count,
+        HIDDEN_SIZE,
+        INTERMEDIATE_SIZE);
+
+    const cublasStatus_t up_status = projectBf16RowMajor(
+        cublas_handle,
+        normalized_gpu,
+        weights.mlp_up_proj[layer],
+        up_gpu,
+        token_count,
+        HIDDEN_SIZE,
+        INTERMEDIATE_SIZE);
+
+    if (gate_status != CUBLAS_STATUS_SUCCESS ||
+        up_status != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "MLP gate/up projection failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    // SwiGLU overwrites gate with SiLU(gate) * up. The attention projection
+    // buffer is free to reuse for the 2048-wide MLP down projection.
+    if (launchSwiGlu(gate_gpu, up_gpu, token_count, INTERMEDIATE_SIZE) != cudaSuccess ||
+        projectBf16RowMajor(
+            cublas_handle,
+            gate_gpu,
+            weights.mlp_down_proj[layer],
+            output_projection_gpu,
+            token_count,
+            INTERMEDIATE_SIZE,
+            HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
+        launchResidualAdd(
+            activations_gpu,
+            output_projection_gpu,
+            token_count,
+            HIDDEN_SIZE) != cudaSuccess)
+    {
+        std::cerr << "MLP or residual launch failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    execution_error = cudaDeviceSynchronize();
+    if (execution_error != cudaSuccess)
+    {
+        std::cerr << "MLP execution failed in layer " << layer << ": "
+                  << cudaGetErrorString(execution_error) << '\n';
+        free_prefill_buffers();
+        return -1;
+    }
+    } // next layer uses this layer's residual output as its hidden state
+
+    // Only the last prompt position contributes the next-token logits.
+    const __nv_bfloat16 *last_hidden =
+        activations_gpu + static_cast<size_t>(token_count - 1) * HIDDEN_SIZE;
+    if (launchRmsNorm(last_hidden, normalized_gpu, weights.norm, 1) != cudaSuccess)
+    {
+        std::cerr << "final RMSNorm launch failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    if (cudaMalloc(&logits_gpu, VOCAB_SIZE * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&next_token_gpu, sizeof(int)) != cudaSuccess)
+    {
+        std::cerr << "LM head buffer allocation failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
+    // cuBLAS sees the row-major [vocab, hidden] weight as column-major
+    // [hidden, vocab]. Transposing it gives [vocab, 1] FP32 logits.
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    if (cublasGemmEx(
+            cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            VOCAB_SIZE, 1, HIDDEN_SIZE,
+            &alpha, weights.lm_head, CUDA_R_16BF, HIDDEN_SIZE,
+            normalized_gpu, CUDA_R_16BF, HIDDEN_SIZE,
+            &beta, logits_gpu, CUDA_R_32F, VOCAB_SIZE,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS ||
+        launchArgmax(logits_gpu, next_token_gpu, VOCAB_SIZE) != cudaSuccess ||
+        cudaMemcpy(&next_token_id, next_token_gpu, sizeof(int),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+    {
+        std::cerr << "LM head or argmax failed\n";
+        free_prefill_buffers();
+        return -1;
+    }
+
     free_prefill_buffers();
     return 0;
 }
 
-int main()
+int main(int argc, char **argv)
 {
     // checkGPUStatus();
     LLamaWeights weights{};
-    // temporarily using prompt as hello world, will be modified to take user input
-    const std::string prompt = "Hello World!";
+    const std::string prompt = argc > 1 ? argv[1] : "Hello World!";
     const std::string tokenizer_path = "models/llama-3.2-1b-instruct/tokenizer.model";
     if (loadLlamaModel(weights) != 0)
     {
         return -1;
     }
 
-    constexpr int MAX_SEQUENCE_LENGTH = 2048;
     float *cos_table_gpu = nullptr;
     float *sin_table_gpu = nullptr;
 
@@ -912,7 +1063,7 @@ int main()
     Tokenizer tokenizer;
     std::string tokenizer_error;
 
-    if (!tokenizer.load("models/llama-3.2-1b-instruct/tokenizer.model",
+    if (!tokenizer.load(tokenizer_path,
                         &tokenizer_error))
     {
         std::cerr << tokenizer_error << '\n';
@@ -922,12 +1073,20 @@ int main()
         return -1;
     }
 
-    std::vector<int> token_ids = tokenize(tokenizer);
+    std::vector<int> token_ids = tokenize(tokenizer, prompt);
+    int next_token_id = -1;
     const int prefill_status = prefill(
         token_ids,
         weights,
         cos_table_gpu,
-        sin_table_gpu);
+        sin_table_gpu,
+        next_token_id);
+
+    if (prefill_status == 0)
+    {
+        std::cout << "Next token ID: " << next_token_id << '\n';
+        std::cout << "Next token: " << tokenizer.decode({next_token_id}) << '\n';
+    }
 
     cudaFree(cos_table_gpu);
     cudaFree(sin_table_gpu);

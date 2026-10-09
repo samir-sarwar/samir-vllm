@@ -50,3 +50,16 @@ cudaError_t launchResidualAdd(
     const __nv_bfloat16 *update,
     int token_count,
     int hidden_size);
+
+// gate = SiLU(gate) * up, in-place, over [token, intermediate] values.
+cudaError_t launchSwiGlu(
+    __nv_bfloat16 *gate,
+    const __nv_bfloat16 *up,
+    int token_count,
+    int intermediate_size);
+
+// Writes the smallest vocabulary index with the maximum FP32 logit.
+cudaError_t launchArgmax(
+    const float *logits,
+    int *token_id,
+    int vocabulary_size);

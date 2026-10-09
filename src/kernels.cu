@@ -420,6 +420,68 @@ __global__ void residualAddKernel(
         __bfloat162float(update[value_index]));
 }
 
+__global__ void swiGluKernel(
+    __nv_bfloat16 *gate,
+    const __nv_bfloat16 *up,
+    size_t value_count)
+{
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= value_count)
+    {
+        return;
+    }
+
+    const float g = __bfloat162float(gate[index]);
+    const float u = __bfloat162float(up[index]);
+    gate[index] = __float2bfloat16((g / (1.0f + expf(-g))) * u);
+}
+
+// One block is sufficient for a single next-token prediction. Each thread
+// scans a strided portion of the vocabulary, then the block reduces the
+// candidates. Equal logits choose the lower token ID deterministically.
+__global__ void argmaxKernel(const float *logits, int *token_id, int vocabulary_size)
+{
+    constexpr int THREADS = 256;
+    __shared__ float best_values[THREADS];
+    __shared__ int best_indices[THREADS];
+
+    const int thread = threadIdx.x;
+    float best_value = -CUDART_INF_F;
+    int best_index = vocabulary_size;
+    for (int index = thread; index < vocabulary_size; index += THREADS)
+    {
+        const float value = logits[index];
+        if (value > best_value || (value == best_value && index < best_index))
+        {
+            best_value = value;
+            best_index = index;
+        }
+    }
+    best_values[thread] = best_value;
+    best_indices[thread] = best_index;
+    __syncthreads();
+
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (thread < stride)
+        {
+            const float other_value = best_values[thread + stride];
+            const int other_index = best_indices[thread + stride];
+            if (other_value > best_values[thread] ||
+                (other_value == best_values[thread] && other_index < best_indices[thread]))
+            {
+                best_values[thread] = other_value;
+                best_indices[thread] = other_index;
+            }
+        }
+        __syncthreads();
+    }
+    if (thread == 0)
+    {
+        *token_id = best_indices[0];
+    }
+}
+
 /* -------------- Kernel Launchers -------------- */
 cudaError_t launchEmbeddingGather(
     const int *token_id_gpu,
@@ -595,5 +657,37 @@ cudaError_t launchResidualAdd(
         update,
         value_count);
 
+    return cudaGetLastError();
+}
+
+cudaError_t launchSwiGlu(
+    __nv_bfloat16 *gate,
+    const __nv_bfloat16 *up,
+    int token_count,
+    int intermediate_size)
+{
+    if (token_count == 0)
+    {
+        return cudaSuccess;
+    }
+    if (gate == nullptr || up == nullptr || token_count < 0 || intermediate_size <= 0)
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr int THREADS_PER_BLOCK = 256;
+    const size_t value_count = static_cast<size_t>(token_count) * intermediate_size;
+    const size_t block_count = (value_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    swiGluKernel<<<block_count, THREADS_PER_BLOCK>>>(gate, up, value_count);
+    return cudaGetLastError();
+}
+
+cudaError_t launchArgmax(const float *logits, int *token_id, int vocabulary_size)
+{
+    if (logits == nullptr || token_id == nullptr || vocabulary_size <= 0)
+    {
+        return cudaErrorInvalidValue;
+    }
+    argmaxKernel<<<1, 256>>>(logits, token_id, vocabulary_size);
     return cudaGetLastError();
 }

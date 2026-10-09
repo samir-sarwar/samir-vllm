@@ -25,11 +25,12 @@ The series follows what happens between a prompt and a generated token, from loa
 - A local BPE tokenizer that supports Unicode, special tokens, encode/decode, and the Instruct chat prompt format; its expected output is covered by a dedicated test executable.
 - A CUDA embedding-gather kernel and prefill path that copies prompt token IDs to the GPU and allocates activations.
 - A CUDA RMSNorm kernel for the 2,048-wide hidden state: it reduces in FP32, applies the learned BF16 weights, and is now run as the first operation of layer 0 during prefill.
-- Layer 0 prefill now projects Q/K/V with cuBLAS, rotates Q/K with RoPE, computes causal grouped-query attention and stable softmax, mixes values, then applies the output projection and residual.
+- Dense causal prefill now runs all 16 layers: Q/K/V projection, RoPE, grouped-query attention, output projection, the attention residual, post-attention RMSNorm, SwiGLU MLP, and the MLP residual.
+- The final RMSNorm and tied embedding/LM-head projection produce FP32 logits for the last prompt position; GPU argmax selects and prints one next token.
 
 ## Next steps
 
-Next are the post-attention normalization and MLP, then the remaining layers and next-token output. KV-cache management and batching come later.
+KV-cache management, token-at-a-time decode, and batching come later. This version predicts one next token per prompt by running dense prefill.
 
 ## Build
 
@@ -48,7 +49,7 @@ mkdir -p models/llama-3.2-1b-instruct
 cp models/Llama-3.2-1B-Instruct/original/tokenizer.model models/llama-3.2-1b-instruct/
 cmake -S . -B build
 cmake --build build -j
-./build/samir-vllm
+./build/samir-vllm "Hello World!"
 ./build/tokenizer-test models/llama-3.2-1b-instruct/tokenizer.model
 ```
 
