@@ -27,13 +27,17 @@ The series follows what happens between a prompt and a generated token, from loa
 - A fixed Llama 3.2 1B Instruct weight layout, with direct pointers to the embedding, normalization, attention, and MLP tensors across all 16 layers.
 - A local BPE tokenizer that supports Unicode, special tokens, encode/decode, and the Instruct chat prompt format; its expected output is covered by a dedicated test executable.
 - A CUDA embedding-gather kernel and prefill path that copies prompt token IDs to the GPU and allocates activations.
-- A CUDA RMSNorm kernel for the 2,048-wide hidden state: it reduces in FP32, applies the learned BF16 weights, and is now run as the first operation of layer 0 during prefill.
+- A CUDA RMSNorm kernel for the 2,048-wide hidden state: it reduces in FP32 and applies the learned BF16 weights throughout the forward pass.
 - Dense causal prefill now runs all 16 layers: Q/K/V projection, RoPE, grouped-query attention, output projection, the attention residual, post-attention RMSNorm, SwiGLU MLP, and the MLP residual.
-- The final RMSNorm and tied embedding/LM-head projection produce FP32 logits for the last prompt position; GPU argmax selects and prints one next token.
+- The final RMSNorm and tied embedding/LM-head projection produce FP32 logits; GPU argmax selects each next token.
+- A contiguous BF16 KV cache for every layer. Prefill fills it from the whole prompt; decode processes one new token at its absolute RoPE position and attends to the cached prefix.
+- Greedy response generation with Instruct chat formatting, end-of-turn/end-of-text stopping, and configurable output length within the 2,048-token context.
+
+Part 8 follows these changes in [Prefill, Decode, and the KV Cache](proper_notes/youtubePT8_prefill_decode_kv_cache.md).
 
 ## Next steps
 
-KV-cache management, token-at-a-time decode, and batching come later. This version predicts one next token per prompt by running dense prefill.
+Batching, paged KV storage, and reusing scratch allocations across decode steps come later. This version runs one sequence at a time and prioritizes readable, explicit operations.
 
 ## Build
 
@@ -52,17 +56,23 @@ mkdir -p models/llama-3.2-1b-instruct
 cp models/Llama-3.2-1B-Instruct/original/tokenizer.model models/llama-3.2-1b-instruct/
 cmake -S . -B build
 cmake --build build -j
-./build/samir-vllm "Hello World!"
+./build/samir-vllm "Explain the KV cache in two sentences." 128
 ./build/tokenizer-test models/llama-3.2-1b-instruct/tokenizer.model
+./build/kv-cache-test
+./build/kv-cache-test --model
 ```
+
+The second argument is `max_new_tokens` (default: 128). The prompt is formatted as an Instruct user message; the executable prints the generated response and its token IDs. Generation stops at a model stop token or the output/context limit.
+
+`kv-cache-test` checks GPU attention against CPU calculations without model weights. With `--model`, it also compares cached decode with dense full-prefix inference, including cache reset and bounds checks. Both modes require a CUDA GPU. An independent Hugging Face comparison is available with `python3 python/reference_generation.py "Say hello in one sentence." --max-new-tokens 32` (requires `torch`, `transformers`, and access to the matching model).
 
 ## Project layout
 
 ```text
 src/           Engine entry point, CUDA kernels, and tokenizer implementation
 include/       Public kernel and tokenizer headers
-tests/         Tokenizer tests
-python/        Tokenizer helper script
+tests/         Tokenizer and GPU attention/KV-cache tests
+python/        Tokenizer and generation reference scripts
 proper_notes/  Notes for the video series
 notes.md       Working notes from the build
 ```

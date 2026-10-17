@@ -331,18 +331,18 @@ __global__ void causalMaskKernel(
 // key positions, which keeps this valid for contexts longer than one CUDA block.
 __global__ void stableSoftmaxKernel(
     __nv_bfloat16 *scores,
-    int token_count)
+    int key_count)
 {
     constexpr int THREADS_PER_BLOCK = 256;
     __shared__ float reductions[THREADS_PER_BLOCK];
 
     const int thread_index = threadIdx.x;
     const size_t row_start =
-        static_cast<size_t>(blockIdx.x) * token_count;
+        static_cast<size_t>(blockIdx.x) * key_count;
 
     float local_max = -CUDART_INF_F;
     for (int key_token = thread_index;
-         key_token < token_count;
+         key_token < key_count;
          key_token += THREADS_PER_BLOCK)
     {
         local_max = fmaxf(
@@ -369,7 +369,7 @@ __global__ void stableSoftmaxKernel(
     const float row_max = reductions[0];
     float local_sum = 0.0f;
     for (int key_token = thread_index;
-         key_token < token_count;
+         key_token < key_count;
          key_token += THREADS_PER_BLOCK)
     {
         local_sum += expf(
@@ -392,7 +392,7 @@ __global__ void stableSoftmaxKernel(
 
     const float inverse_sum = 1.0f / reductions[0];
     for (int key_token = thread_index;
-         key_token < token_count;
+         key_token < key_count;
          key_token += THREADS_PER_BLOCK)
     {
         const float probability = expf(
@@ -608,14 +608,19 @@ cudaError_t launchCausalMask(
 cudaError_t launchStableSoftmax(
     __nv_bfloat16 *scores,
     int token_count,
-    int num_query_heads)
+    int num_query_heads,
+    int key_count)
 {
+    if (key_count == 0)
+    {
+        key_count = token_count;
+    }
     if (token_count == 0)
     {
         return cudaSuccess;
     }
 
-    if (scores == nullptr || token_count < 0 || num_query_heads <= 0)
+    if (scores == nullptr || token_count < 0 || key_count <= 0 || num_query_heads <= 0)
     {
         return cudaErrorInvalidValue;
     }
@@ -624,7 +629,7 @@ cudaError_t launchStableSoftmax(
     const int row_count = num_query_heads * token_count;
     stableSoftmaxKernel<<<row_count, THREADS_PER_BLOCK>>>(
         scores,
-        token_count);
+        key_count);
 
     return cudaGetLastError();
 }

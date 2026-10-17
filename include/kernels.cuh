@@ -37,12 +37,14 @@ cudaError_t launchCausalMask(
     int token_count,
     int num_query_heads);
 
-// Applies a numerically stable softmax over the key-token dimension in-place.
-// scores is laid out as [query_head, query_token, key_token].
+// Applies stable softmax over key positions in-place.
+// scores is [query_head, query_token, key_token]. Prefill uses T x T rows;
+// decode uses one query row over all cached keys for each head.
 cudaError_t launchStableSoftmax(
     __nv_bfloat16 *scores,
     int token_count,
-    int num_query_heads);
+    int num_query_heads,
+    int key_count = 0);
 
 // Adds update to hidden_state in-place. Both buffers are [token, hidden].
 cudaError_t launchResidualAdd(
