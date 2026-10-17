@@ -557,3 +557,201 @@ probability[v] = exp(logits[v]) / sum(exp(logits))
 Where the sum includes every vocabulary token. But for argmax we don’t actually need to calculate this, because softmax preserves the ordering of the scores, meaning whichever token had the highest logit will also have the highest probability. So our engine can just find the largest logit directly.
 Lastly, the token ID we chose needs to be decoded using the tokenizer so we can get its text or bytes. Remember a token could be a whole word, part of a word, punctuation or something else, so choosing one token doesn’t necessarily mean we’ve generated a whole word.
 That chosen token becomes the next position in the sequence, and when generation continues, the model processes that new position and uses its final vector to predict the token after it.
+
+Decode:
+Prefill vs.Decode:
+So up until now we’ve pretty much been looking at what happens when we give the model an input prompt, turn it into token IDs, get their embedding vectors and pass them through all 16 transformer layers, then use the final RMSNorm, LM head and argmax to choose the next token. This initial phase of processing the prompt is called prefill, and it’s what gives us our first generated token.
+Remember though, that first generated token usually isn’t the whole answer, it might just be a word or even part of a word, so now we need to keep generating. The token we just chose becomes part of the sequence, and the model needs to use it along with the earlier context to predict the token after that. This repeated phase is called decode.
+Let’s use a small example where each letter stands for one token:
+Input prompt: [A, B, C]
+During prefill we process A, B and C through the model, and the final vector at position C is what we use to predict the next token. Say we choose D:
+Prefill:
+[A, B, C] → predict D
+
+Our sequence is now:
+[A, B, C, D]
+Now D is the latest token, so we need to process its position through the model to predict what comes after it. Say that gives us E, then we process E to predict the next one, and this keeps going:
+Decode step 1:
+Process D with the earlier context → predict E
+
+Decode step 2:
+Process E with the earlier context → predict F
+
+Decode step 3:
+Process F with the earlier context → predict the next token
+One thing to keep in mind here is that choosing D during prefill doesn’t mean D has already gone through the transformer layers, we only just selected its ID from the vocabulary scores. It still needs its own embedding lookup and forward pass before we can use its final vector to predict E.
+The main difference in how we perform these phases is that during prefill we have all the prompt tokens available, meaning within each layer we can calculate their representations together using matrices. Causal masking still applies though, so a position can only attend to itself and earlier positions even when we calculate them together.
+During ordinary decode, for one sequence we process one new token position at a time, because we need to choose that token before we can feed it into the next step. It still goes through all 16 layers, including attention and the FFN, we haven’t skipped those computations just because we’re only working on one new position.
+So if our prompt had N tokens, the hidden-state matrix during prefill has shape:
+[N, 2048]
+Whereas the new hidden state we process during each decode step has shape:
+[1, 2048]
+Remember though, having one row here doesn’t mean the model only has one token of context. Attention still needs information from the earlier positions, and this is where the KV cache comes in, it lets us keep the keys and values we already calculated so we can use them again while processing the new token.
+Also, decode here means this phase of generating further tokens, which is separate from tokenizer decoding, where we convert token IDs back into text.
+Why cache?:
+So now we know that prefill processes our prompt and decode keeps generating from there, but we haven’t really explained how we can process just the new token while still using the earlier context. The most straightforward way would be to take the entire sequence we have so far and run it through the model again every time we want another token.
+Using our example from before:
+Run [A, B, C] → predict D
+Run [A, B, C, D] → predict E
+Run [A, B, C, D, E] → predict F
+This would work, but remember everything that happens inside one forward pass, we need the embedding lookup, the normalization, Q/K/V projections, attention, the FFN and the residual additions, repeated through all 16 layers. Meaning every time we add one token we would also be doing all that work again for the earlier positions.
+For a short example like this it might not seem like a big deal, but imagine having a prompt with thousands of tokens and then generating hundreds more, we’d keep calculating the same earlier positions over and over just to predict one new token.
+The reason we can avoid this comes back to causal masking. Remember a token position can only attend to itself and positions before it, so adding something after that position doesn’t give it any new information it’s allowed to use.
+Let’s look at what each position can attend to in our original prompt:
+A can attend to: A
+B can attend to: A, B
+C can attend to: A, B, C
+Then we append D:
+A can attend to: A
+B can attend to: A, B
+C can attend to: A, B, C
+D can attend to: A, B, C, D
+Notice that nothing changed for A, B or C. Their token IDs and positions are the same, and the set of positions they can attend to is the same. D can use information from them, but they can’t use information from D because it comes after them.
+This also holds through the whole model. In layer 0, the earlier positions receive the same input vectors and use the same learned weights, and their attention still only sees the same allowed positions, so they produce the same outputs. The RMSNorm and FFN operations process each position independently too, meaning appending D doesn’t change those computations for A, B or C either.
+Then layer 1 receives those same earlier-position outputs from layer 0, so the same reasoning applies again, and this keeps holding through all 16 layers. We don’t need to go back and update the earlier positions when a new token arrives.
+So when we process D, we still need the earlier positions’ keys and values for attention, but we don’t need to recalculate them. We can keep the ones we already computed during prefill and reuse them, which is pretty much the motivation behind the KV cache.
+Prefill [A, B, C]:
+Calculate their representations
+Keep their K and V values at each layer
+Predict D
+
+Decode D:
+Calculate D’s new representation
+Use the stored K and V from A, B and C
+Include D’s own K and V in attention
+Keep D’s K and V for later steps
+Predict E
+Remember we’re keeping these separately for each layer, because the keys and values calculated in layer 0 are different from the ones calculated in layer 1, each layer has its own weights and receives different hidden states.
+This saves us from rerunning the earlier positions through the model, but the new token still has to attend over the accumulated keys and values, so the amount of attention work can still grow as the sequence gets longer. What we’ve removed is the repeated computation of the earlier token positions, by keeping the results that future positions actually need.
+
+We’ve now explained why we can reuse earlier computations, but we need to be a bit more specific about what we’re actually keeping. The KV cache stores the key and value vectors calculated for the token positions we’ve already processed, separately for every transformer layer. Remember these are the outputs of the K and V projections, they aren’t the learned W_k and W_v weight matrices themselves.
+The weight matrices stay fixed during inference, whereas the cached vectors depend on the input sequence. Meaning two different prompts will generally produce different keys and values, even though we use the same model weights to calculate them.
+Let’s start with one sequence and one layer. In our Llama model we have:
+32 query heads × 64 values = 2048 Q values per token
+8 key heads × 64 values = 512 K values per token
+8 value heads × 64 values = 512 V values per token
+Remember this difference comes from grouped query attention, every group of four query heads shares one key head and one value head. So we only need to store eight heads worth of keys and values per token, we don’t need to duplicate them to match all 32 query heads.
+For our prompt [A, B, C], one layer’s cache can be thought of as:
+K cache:
+[k_A]
+[k_B]
+[k_C]
+V cache:
+[v_A]
+[v_B]
+[v_C]
+Each row here has 512 values, containing the eight heads placed beside each other. We have a separate set of these rows for every layer, because each layer calculates its own K and V using its own weights and the hidden states it receives.
+A simple way to describe each cache’s layout is:
+[layer, token_position, kv_feature]
+K cache: [16, capacity, 512]
+V cache: [16, capacity, 512]
+Where capacity is how many token positions we’ve reserved space for, and the valid length tells us how many positions actually contain results we can use. So reserving space for more tokens doesn’t mean we should include those unused positions in attention.
+One detail to remember from RoPE is that we rotate Q and K, but not V. In our implementation the cached keys have already had RoPE applied using their positions in the sequence, while the cached values are the outputs of the V projection without that rotation. Meaning when we read an earlier key from the cache later on, we don’t rotate it again.
+We also don’t need to keep the earlier queries for future decode steps. Remember the query represents what the position currently being processed is looking for, so when we process a new token we calculate its new query and compare it with the stored keys. The earlier queries were used to calculate the earlier positions’ attention outputs, which we’ve already finished.
+The attention scores and softmax results aren’t what we keep in the KV cache either, because the new token has a different query and needs its own scores against the available keys.
+Now let’s go through one full decode step using the example we’ve been working with:
+Prompt already processed: [A, B, C]
+Next token chosen: D
+Cached positions: 3
+D’s position: 3
+We’re using zero-based positions here, so A is at position 0, B at 1, C at 2 and D at 3. Remember choosing D’s token ID doesn’t mean we’ve processed D yet, at this point the cache still only contains A, B and C.
+First we use D’s token ID to get its embedding vector from the embedding table, giving us our starting hidden state with shape [1, 2048]. Then we enter layer 0 and apply its first RMSNorm, just like we did during prefill.
+Using that normalized vector, we calculate D’s Q, K and V:
+normalized = RMSNorm(hidden_state)
+q_D = normalized × W_qᵀ
+k_D = normalized × W_kᵀ
+v_D = normalized × W_vᵀ
+The output shapes are:
+q_D = [1, 2048]
+k_D = [1, 512]
+v_D = [1, 512]
+So these are the same projections we’ve already covered, but now we only calculate one token row. We don’t recalculate q_A, k_A, v_A and all the others again.
+Next we apply RoPE to D’s query and key using position 3. Even though our current input buffer only has one token in it, that token’s position in the sequence is still 3, we can’t treat it as position 0 just because it’s the first row in this new buffer.
+q_D = RoPE(q_D, position=3)
+k_D = RoPE(k_D, position=3)
+Then we put D’s key and value into the next cache slot for this layer:
+K cache:
+[k_A]
+[k_B]
+[k_C]
+[k_D]
+V cache:
+[v_A]
+[v_B]
+[v_C]
+[v_D]
+The earlier keys already have their positional rotations, and D’s new key now has its own, so they’re ready to use together in attention.
+For the current query to attend to itself, we need to include D’s key and value as well as the earlier ones. Meaning we now have four valid key positions for D’s attention calculation.
+Let’s look at one query head. It has 64 values, and we select the key head it shares according to the GQA grouping:
+kv_head = query_head / 4
+Using integer division, so query heads 0 through 3 use KV head 0, query heads 4 through 7 use KV head 1, and so on.
+For this one query head, the attention score calculation is:
+scores = q_D_head × K_cached_headᵀ / sqrt(64)
+The dimensions are:
+[1, 64] × [64, 4] = [1, 4]
+So we get four scores, one comparing D’s query with A’s key, one with B’s key, one with C’s key and one with D’s own key.
+This is different from prefill, where each head calculated scores for multiple query positions. Here we have one query position, but it still needs to compare against all four available key positions.
+In this one-token decode case, every valid cached position is either earlier than D or D itself, so there aren’t any future positions to mask. We still need to restrict attention to the valid cache entries though, otherwise we’d accidentally include unused memory from the space we reserved.
+Then we apply softmax across those four scores to get the attention weights. Remember our stable version subtracts the maximum score before taking the exponentials:
+weight[j] =
+exp(score[j] - max_score)
+/ sum(exp(score - max_score))
+
+Now we use those weights to combine the matching value vectors:
+head_output = attention_weights × V_cached_head
+With shapes:
+[1, 4] × [4, 64] = [1, 64]
+Or looking at the weighted sum directly:
+head_output =
+weight_A × v_A_head
+
+- weight_B × v_B_head
+- weight_C × v_C_head
+- weight_D × v_D_head
+  We do this for all 32 query heads, each using the key and value head assigned to its group. Then we place the 32 head outputs beside each other, giving us 2048 values, apply the output projection and add the result back through the attention residual connection.
+  After that it’s the second RMSNorm, the gate and up projections, SiLU, elementwise multiplication, down projection and the FFN residual add, all the computations we’ve already covered. The KV cache hasn’t replaced any of those operations for D, it has saved us from having to redo the earlier token positions.
+  Now D’s updated hidden state goes into layer 1, where we repeat the process using layer 1’s weights and layer 1’s cache. Meaning we calculate a new Q, K and V for D at this layer, we don’t reuse its layer 0 projections, because layer 1 receives a different representation and has different learned weights.
+  This continues through all 16 layers, and by the end D has a key and value stored at position 3 in every layer’s cache. Position 3 is the same throughout the model, we aren’t moving to a new sequence position every time we move to a new layer.
+  Finally we apply the final RMSNorm, calculate the vocabulary logits with the LM head and use argmax to choose the next token. Say we choose E:
+  Tokens now processed and cached: [A, B, C, D]
+  Next token chosen: E
+  Cache length: 4
+  E’s position when processed next: 4
+  One detail here that’s easy to mix up, the cache length counts tokens we’ve actually processed, not every token ID we’ve predicted. So after this step we have D’s K and V stored, but we don’t have E’s yet, those will be calculated when E becomes the input to the next decode step.
+  So now we’ve seen how the KV cache saves us from recalculating the earlier token positions, but keeping those results takes up GPU memory, meaning we’re trading memory for less repeated computation. The model weights are already using memory, and now we also need space for the keys and values produced by the sequence we’re processing.
+  Remember we store K and V separately for every layer, and in our model each token produces eight key heads and eight value heads, with 64 values per head. We’re storing these values in BF16, which takes two bytes per value.
+  So the amount of KV data for one processed token across the whole model is:
+  2 × number_of_layers × number_of_KV_heads × head_dimension × bytes_per_value
+  The first 2 is because we store both keys and values. Putting in our model’s numbers:
+  2 × 16 × 8 × 64 × 2 = 32768 bytes
+
+32768 bytes = 32 KiB per token
+Meaning if we had 2048 processed token positions, the K and V data would take:
+2048 × 32768 = 67108864 bytes
+
+67108864 bytes = 64 MiB
+That’s just the KV cache for one sequence, we still need memory for the model weights, temporary computation buffers and the other things our engine uses.
+This also shows one of the benefits of grouped query attention. We still calculate 32 query heads, but only store eight heads worth of keys and values. If we instead had 32 K/V heads with the same head dimension and storage type, this cache would take four times as much memory.
+There’s a difference here between the amount of valid data and the amount of memory we’ve allocated though. In our current implementation we reserve space for a capacity when we initialize the cache, then fill that space as we process tokens. So the valid cache length grows during decode, but we aren’t calling cudaMalloc for one extra token every step, that space is already reserved.
+capacity = number of token positions we have space for
+length = number of token positions we have actually processed
+If we later want to serve multiple sequences at once, each sequence also needs access to its own cached results. So longer contexts and more simultaneous requests both increase how much KV memory we need, which is part of why memory management becomes such a big deal in inference engines.
+Another thing to remember is that caching doesn’t make every decode step the same amount of work. We’ve removed the repeated projections and other computations for earlier positions, but the new query still needs to read and attend over their keys and values.
+Processing D → attends over A, B, C, D
+Processing E → attends over A, B, C, D, E
+Processing F → attends over A, B, C, D, E, F
+So for the full attention we’re using, a longer sequence means more cached data to read and more attention scores to calculate. Reading the cache uses GPU memory bandwidth, and the model’s weight matrices also need to be read for the new token’s computations, meaning memory movement can become a major part of decode time even though we’ve saved a lot of arithmetic.
+Now that we’re keeping data between forward passes, we also need to keep track of which data is valid and when we’re allowed to use it. Otherwise we could have all the attention math right and still get incorrect results because we read the wrong cache positions.
+For a simple cache like ours, before processing a new token we need:
+0 <= length < capacity
+
+new_token_position = length
+valid_positions_after_append = length + 1
+So if length is 3, positions 0, 1 and 2 already contain valid results, and the new token goes into position 3. After that token has been processed through all the layers, we update length to 4.
+Remember this position is also what we use for RoPE, we can’t reset it to zero at every decode step. We also need to write into the correct layer’s cache, because using layer 0’s keys while calculating layer 1’s attention would mix results from different computations.
+When attention reads the cache, it should only read the valid positions, including the token currently being processed. Any space beyond that is just reserved memory, we can’t assume it contains useful values or even zeros.
+Then we need to decide when generation stops. In our engine we check for the tokenizer’s end-of-turn or end-of-sequence token, and we also have a maximum number of generated tokens and a context limit so we don’t keep going forever or run out of cache space.
+One detail here, if the token we just predicted tells us to stop, we don’t need to pass it through another decode step. The same applies when we’ve reached the number of output tokens we wanted, there’s no reason to process the final prediction if we aren’t going to ask the model for anything after it.
+When the request finishes, our simple implementation frees the K and V allocations. We could also keep an allocation around to use for another request, but then we need to reset the valid length and fill it with the new sequence’s results, we can’t treat the old contents as context for an unrelated prompt.
+This is because the cached vectors depend on the whole prefix leading up to each position. Even if two prompts contain the same word somewhere, that doesn’t mean its cached K and V are interchangeable, because its position and the earlier context may be different.
+Lastly, a useful way to check that we’ve implemented this correctly is to compare a cached decode step against running the full growing sequence again without reusing cached results. They should produce closely matching next-token logits, allowing for floating-point differences, because caching is supposed to reuse the same computations rather than change what the model calculates. Looking at the logits is useful here, since two implementations could pick the same highest-scoring token even if some of their scores are wrong.
