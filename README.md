@@ -20,6 +20,12 @@ The series follows what happens between a prompt and a generated token, from loa
 | [![Part 6: Multi-head self-attention](https://img.youtube.com/vi/tTULacSPXkc/hqdefault.jpg)](https://youtu.be/tTULacSPXkc) | [![Part 7: Feed-forward network and SwiGLU](https://img.youtube.com/vi/HjllfB1IPrE/hqdefault.jpg)](https://youtu.be/HjllfB1IPrE) |
 | [Multi-head self-attention](https://youtu.be/tTULacSPXkc) | [Feed-forward network: SwiGLU and MLP](https://youtu.be/HjllfB1IPrE) |
 
+### Part 8
+
+[![Part 8: Decode and KV cache](https://img.youtube.com/vi/yFwPpH1Hb14/hqdefault.jpg)](https://youtu.be/yFwPpH1Hb14)
+
+[Decode and KV cache, simply explained](https://youtu.be/yFwPpH1Hb14)
+
 ## What works so far
 
 - A C++17 / CUDA project, built with CMake and linked with ICU for Unicode-aware tokenization.
