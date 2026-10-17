@@ -393,3 +393,167 @@ Sₕ = (Qₕ × K_kv_headᵀ) / √64 + M
 Aₕ = softmax(Sₕ)
 head_outputₕ = Aₕ × V_kv_head
 The reason we do this is that it keeps the multiple query perspectives that make multi-head attention so powerful, while using fewer key and value vectors. This saves a ton of KV-cache memory during inference. We’ll get into why that’s so important later on ;)
+
+Feed Forward Network:
+Ok perfect, so up until now, within the full model architecture of LLama, we’ve completed the attention part of one individual layer, you can call the first one layer 0. What does that mean though what have we gained from that, well now each token has an updated representation that incorporates information from itself and earlier tokens in the prompt, pretty much building context for the prompt and we see how that all worked with the mathematical computations behind attention.
+
+Now as you can see, in the architecture diagram, there is a second RMSNorm, which is pretty easy for us because we’ve outputted an output matrix W_o, or you can think of it as the output vectors for each of the tokens after the residual add and so we can just normalize them to prevent blow up or zeroing before we go to the Feed Forward Network (FFN).
+
+Now the weights in the FFN are very important, they were maticulously modified during training to ensure that with the help of attention as well when we produced the next token and the ones after that it was a coherent correct answer.
+
+Lets think through this with an analogy, think of a group of people working through problem, where where each person represents one token and holds a page of notes which is the token’s vector.
+Attention is like exchanging information between the people,
+remember though not everyone can share due to causal masking, you
+can only share amongst the people before you.
+
+    FFN is like after you have exchanged information with whoever you
+
+can for one round, everyone is given a paper of rules or hints
+that they apply to their answers individually without consulting
+anyone that further enriches this answer.
+
+Within our model architecture, this process repeats 16 times between transformer layers.
+
+FFN pretty much is just adding more information to our output vectors, independently, without the context of the other tokens within the prompt. It is looking at the features within the token, and using learned weights to build the representation better.
+
+I hope that little intro made a bit of sense, but now we are going to go into the thing that really builds what a feed forward network really is. The perceptron, you can think of a perceptron as being one weighted decision, This means there are weights, and there are inputs and we apply certain weights to certain input values to compute a mathematical value that could bring us to some conclusion. This is best understood in an example.
+Imagine a program that tries to decide whether a message is urgent. We give it two numbers:
+x[0] = 1 if the message contains “urgent”; otherwise 0
+x[1] = the number of exclamation marks
+
+And then we have a code representation of a perceptron:
+float score =
+1.5f _ x[0] +
+0.25f _ x[1] -
+1.0f;
+
+bool is_urgent = score > 0.0f;
+
+You can see the weights we applied, we put a more significant importance to the number of times the message contains urgent as opposed to the number of exclamation marks, and this makes sense to us as the goal is quite simple and its easy to say that a message containing the word urgent would garner a higher score for checking urgency. The -1 is a bias. It shifts the point where the answer changes.
+
+This describes the basic shape of a perceptron; take input numbers, calculate a weighted sum, and apply a rule to produce an output.
+Now we did this as a basic example for 2 weights and 2 inputs but for n inputs it’d be more like this:
+
+score = weight[0] × input[0] + weight[1] × input[1] + … + weight[n-1] × input[n-1] + bias
+This sum evidently mirrors the dot product computation.
+Now imagine doing that same weighted sum calculation thousands of times using the same input vector where each calculation has its own learned weights, which means we’re taking the same input numbers and combining them differently each time.
+We can put all these sets of weights into a matrix, where each row holds the weights for one calculation as we’ve done before. Then multiplying that matrix by our input vector gives us all the weighted sums together. Now each row gives us one number, and those numbers together make up our new output vector.
+This is pretty much what we mean by a linear projection, in Llama 3.2 1B model an FFN expansion projection takes the token’s 2048 values and produces 8192 values so we now have a larger vector containing different learned combinations of the input features, which gives the network more room to process them.
+Remember though, in our urgency example we took the weighted sum and checked whether it was above zero to get a yes or no. Llama’s FFN keeps numerical values and uses a form of nonlinear processing called SwiGLU.
+So now we know how we can take a token’s 2048 values, multiply them by a learned weight matrix and get 8192 values back. In Llama’s FFN we actually do this twice, once using a matrix called W_up and again using a separate matrix called W_gate. Remember though both of these are working with the same input vector, which is the token’s vector after our second RMSNorm, meaning we aren’t doing the up projection and then passing its output into the gate projection. They both start from the same input, they just have different learned weights.
+Let’s call that normalized input vector x, then for one token we have:
+x = 2048 values
+W_up = [8192, 2048]
+W_gate = [8192, 2048]
+As we talked about before, every row contains one set of weights that we use to calculate one weighted sum, so having 8192 rows means we get 8192 output values. Each row has 2048 weights because we need one weight for each of the 2048 input values.
+The actual computations look like this:
+up = x × W_upᵀ
+gate = x × W_gateᵀ
+We transpose the weight matrices here because we’re treating x as a row vector, so the dimensions become:
+[1, 2048] × [2048, 8192] = [1, 8192]
+
+up[0] =
+x[0] × W_up[0, 0]
+
+- x[1] × W_up[0, 1]
+- ...
+- x[2047] × W_up[0, 2047]
+  Then for up[1] we use the next row of weights, but still the exact same input vector, and we keep going until we’ve calculated all 8192 values. The gate projection does the same thing using its own weights. Also remember our urgency perceptron had a bias, but these Llama projections don’t, so here we just calculate the weighted sum.
+  The up projection is called up because we’re expanding from 2048 values to 8192, pretty much giving the network more intermediate features to work with. This doesn’t mean we’re copying the original values or just adding zeros to make the vector bigger, each new value comes from a learned combination of the input values. Meaning we now have a larger space to process these different combinations before bringing the vector back down to its original size. Just like with our hidden states though, we can’t assume every position has a neat English meaning that we can point to.
+  The gate projection also gives us 8192 values, but we use these to control how the values from the up projection contribute to the next computation. One thing to remember here is that the gate’s weights are fixed during inference, but its output values aren’t, because those values depend on the token vector we put in. So the same learned matrix can produce different gate values for different tokens.
+  Before we combine the two vectors, we apply an activation function called SiLU to each value in the gate vector. An activation function is pretty much a function we apply to the result of a weighted sum, like in our urgency example where we checked whether the score was greater than zero to give us a boolean. With SiLU we keep a numerical value, and the calculation is:
+  SiLU(g) = g × sigmoid(g)
+  sigmoid(g) = 1 / (1 + e^(-g))
+  SiLU(g) = g / (1 + e^(-g))
+  Where g is one value from our gate vector. The sigmoid part gives us a number between 0 and 1, then we multiply that by the original gate value.
+  Let’s go through an example, say one of our gate values is 2:
+  sigmoid(2) = 1 / (1 + e^(-2)) ≈ 0.8808
+  SiLU(2) = 2 × 0.8808 ≈ 1.7616
+  sigmoid(-2) = 1 / (1 + e²) ≈ 0.1192
+  SiLU(-2) = -2 × 0.1192 ≈ -0.2384
+  sigmoid(0) = 0.5
+  SiLU(0) = 0 × 0.5 = 0
+  So you can see that a positive value can pass through fairly strongly, whereas a very negative value gets pushed close to zero. It’s also a smooth function, so during training we can calculate gradients through it to help adjust the weights.
+  Now that we’ve applied SiLU to the gate vector, we multiply the result by our up vector element by element. Meaning we take the first value from each vector and multiply them, then the second value from each, and keep doing that for all 8192 values.
+  intermediate[j] = SiLU(gate[j]) × up[j]
+  Remember this isn’t a dot product, we don’t add the results together, so we still have 8192 values afterwards.
+  Let’s use smaller vectors so we can actually see the whole computation:
+  gate = [2, -2, 0]
+  up = [3, 4, 5]
+  SiLU(gate) ≈ [1.7616, -0.2384, 0]
+
+intermediate[0] = 1.7616 × 3 ≈ 5.2848
+intermediate[1] = -0.2384 × 4 ≈ -0.9536
+intermediate[2] = 0 × 5 = 0
+intermediate ≈ [5.2848, -0.9536, 0]
+This is where the idea of a gate comes from, we have one branch producing values and another branch producing factors that scale those values based on the input. Looking at the example, the first up value got amplified, the second changed sign and became smaller in magnitude, and the third became zero. So don’t think of this as a strict on/off gate, and don’t assume the multiplier is always between 0 and 1 either. That’s only true for the sigmoid part, the full SiLU output can be negative or greater than 1.
+This combination of SiLU and the elementwise multiplication is called SwiGLU. Pretty much, it lets the contribution of a feature from the up branch depend on a feature calculated by the gate branch, with both coming from the same token’s input vector. These relationships are learned during training.
+The nonlinear computation is important here because if we only multiplied by one learned matrix to expand the vector, then another learned matrix to bring it back down, we could combine those matrices into one and get the same result. So adding SiLU and multiplying the two branches gives us more ways to process the input than a single linear projection could.
+Now we’ve got our processed vector of 8192 values, but remember the token’s existing hidden state has 2048 values, and we eventually need to add our update back to it through the residual connection. So we use another learned matrix called W_down:
+W_down = [2048, 8192]
+down = intermediate × W_downᵀ
+The dimensions are:
+[1, 8192] × [8192, 2048] = [1, 2048]
+
+down[0] =
+intermediate[0] × W_down[0, 0]
+
+- intermediate[1] × W_down[0, 1]
+- ...
+- intermediate[8191] × W_down[0, 8191]
+  Then we do this for every row until we have all 2048 output values. Bringing the vector down doesn’t mean we just delete the extra values, we’re using learned weights to mix the 8192 intermediate values into a smaller vector.
+  Lastly we add this update back to the token’s existing hidden state through the residual connection. One detail here, we add it to the hidden state from before the second RMSNorm, because the normalized vector was what we used inside the FFN branch. So we need to keep that original hidden state available for the addition.
+  Putting the whole computation together:
+  x = RMSNorm(hidden_state)
+  up = x × W_upᵀ
+  gate = x × W_gateᵀ
+  intermediate = SiLU(gate) ⊙ up
+  down = intermediate × W_downᵀ
+  new_hidden_state = hidden_state + down
+  Where ⊙ just means the elementwise multiplication we went through above.
+  Where ⊙ just means the elementwise multiplication we went through above.
+  We’ve been looking at one token to make it easier to follow, but for the whole prompt we can put the token vectors into rows of a matrix and calculate them together. So the expansion projections go from [token_count, 2048] to [token_count, 8192], then the down projection returns us to [token_count, 2048]. Every token position uses the same weights within this layer, but each row is processed independently, meaning we aren’t mixing information between token positions during these FFN computations.
+  So now we’ve gone through all the computations inside one transformer layer, but remember from our architecture diagram that our Llama 3.2 1B model has 16 of these layers, meaning what we’ve just finished is layer 0, and we still have layers 1 through 15 to go through.
+  The way this works is pretty much taking the hidden states we got after the FFN’s residual add and passing them into the next layer, where we do the same sequence of operations again. We don’t go back to the embedding table and start over, the updated vectors from the previous layer become the input for the next one. So when layer 1 calculates its queries, keys and values, it’s calculating them from representations that have already been processed by layer 0.
+  Remember though, having the same operations doesn’t mean every layer uses the same weights. Each layer has its own learned Q, K, V and output projection matrices, its own RMSNorm weights, and its own gate, up and down projection matrices. Meaning the FFN weights are shared between token positions within one layer, like we mentioned before, but they’re different from one layer to another. So each layer gets to work with what the earlier layers have already computed, attention can combine information between token positions again, then the FFN processes the resulting features within each position. We aren’t manually assigning each layer a specific job, their different weights were learned together during training to make this whole sequence useful for predicting the next token.
+  One thing to keep in mind is that for our prompt, the hidden-state matrix still has the same shape after every complete layer, [token_count, 2048]. The numbers inside it have changed, but each token still has a 2048-value vector, which lets us pass it straight into the next layer. These are still internal representations at this point, we haven’t picked an output token after each layer.
+  Then as per the architecture diagram we add the final RMSNorm before an output.
+
+So now we’ve gone through all 16 transformer layers and applied the final RMSNorm, but remember what we have at this point is still a vector of 2048 numbers for a token, these numbers contain the information the model has processed but they aren’t directly telling us what token should come next. For that we need the LM head, where LM pretty much means language modeling, and the head is the part that turns our internal representation or vector into scores/probabilities for possible output tokens.
+Remember our model has a vocabulary of 128256 tokens, so we need to go from 2048 hidden-state values to 128256 scores, one for every possible token ID. We do this using another learned weight matrix:
+W_lm_head = [128256, 2048]
+Each row belongs to one vocabulary token and contains 2048 learned weights, meaning we can take the dot product of our final normalized vector with each row to get a score for that token. These weights were learned during training along with the rest of the model, so the earlier layers and the LM head have been trained together to make useful next-token predictions.
+For generating the next token, we use the vector from the last position in the prompt. Remember causal masking means that position can gather information from all the positions before it as well as itself, so by the time it reaches the end of the model its vector can contain information from the whole prompt.
+Each position’s output is used to predict what comes after that position, meaning if we want to continue the prompt, it’s the last position’s prediction we need. Our engine therefore only runs this final normalization and LM head calculation on the last prompt position.
+Let’s call that final normalized vector h:
+h = [1, 2048]
+logits = h × W_lm_headᵀ
+The dimensions become:
+[1, 2048] × [2048, 128256] = [1, 128256]
+And looking at just the score for a vocabulary token with ID v:
+logits[v] = h[0] × W_lm_head[v, 0] + h[1] × W_lm_head[v, 1] + … + h[2047] × W_lm_head[v, 2047]
+So it’s the same weighted sum computation we’ve already seen, just now each result has a direct connection to a vocabulary token. There’s no bias in this projection either.
+This also connects back to why we spent so much time updating the hidden states through attention and the FFN, changing those hidden-state values changes the dot products we calculate here, meaning it changes which vocabulary tokens receive higher or lower scores.
+The scores we get are called logits. They can be positive or negative and they aren’t probabilities yet, so a score of 5 doesn’t mean a 50% chance or anything like that. What we can say is that a higher logit gives that token a higher ranking for this particular next-token prediction.
+Now we need to actually choose a token, and in our engine we use argmax. This pretty much means finding the position of the largest value in the logits vector. One thing to keep in mind is that we want the index of that value, because the index is the token ID, the score itself isn’t what we send to the tokenizer.
+Let’s use a pretend vocabulary with only five tokens so we can see this clearly:
+Token ID: 0 1 2 3 4
+Logit: 0.4 -1.1 3.7 2.0 -0.3
+The largest score is 3.7, but our chosen token ID is 2, because that’s the position where we found the largest score.
+max(logits) = 3.7
+argmax(logits) = 2
+For our actual model we do the same thing across all 128256 scores. The basic idea can be written as:
+next_token_id = 0
+highest_score = logits[0]
+
+for each remaining token ID:
+if logits[token_id] > highest_score:
+highest_score = logits[token_id]
+next_token_id = token_id
+
+This way of choosing the highest-scoring token is called greedy decoding. For the same logits it picks the same highest-scoring token each time, we aren’t randomly sampling from the possible outputs.
+You may remember softmax from attention, and we can also apply it here if we want to convert the logits into probabilities:
+probability[v] = exp(logits[v]) / sum(exp(logits))
+Where the sum includes every vocabulary token. But for argmax we don’t actually need to calculate this, because softmax preserves the ordering of the scores, meaning whichever token had the highest logit will also have the highest probability. So our engine can just find the largest logit directly.
+Lastly, the token ID we chose needs to be decoded using the tokenizer so we can get its text or bytes. Remember a token could be a whole word, part of a word, punctuation or something else, so choosing one token doesn’t necessarily mean we’ve generated a whole word.
+That chosen token becomes the next position in the sequence, and when generation continues, the model processes that new position and uses its final vector to predict the token after it.
