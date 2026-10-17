@@ -1,6 +1,6 @@
 # Part 8: Prefill, Decode, and the KV Cache
 
-We already run all 16 transformer layers and predict one token. This part turns that into a response by keeping useful work from the prompt and feeding each predicted token back into the model.
+We already run all 16 transformer layers and predict one token, as covered in [Part 7](youtubePT7_feed_forward_swiglu_mlp.md). This part turns that into a response by keeping useful work from the prompt and feeding each predicted token back into the model.
 
 Read the code in this order:
 

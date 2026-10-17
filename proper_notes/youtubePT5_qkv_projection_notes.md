@@ -133,7 +133,7 @@ So the actual call uses `CUBLAS_OP_T`, `CUBLAS_OP_N`, and `(m, n, k) = (O, T, 20
 
 After the three projections, `prefill` calls `launchRope` on `q_gpu` with projection width `2048`, and on `k_gpu` with width `512`. Both use head width `64`, the position IDs, and the precomputed sine/cosine tables. `v_gpu` is left alone. RoPE changes Q/K **activations in place**, so the later Q·K comparisons contain relative-position information.
 
-The host checks cuBLAS return statuses and CUDA launch errors, then synchronizes to catch GPU execution errors. `q_gpu`, `k_gpu`, and `v_gpu` are temporary buffers in this prefill path; they are freed before the function returns. In the current checkout, their next consumer is the layer-0 self-attention code described in [the self-attention notes](youtubePT7_self_attention_completion.md).
+The host checks cuBLAS return statuses and CUDA launch errors, then synchronizes to catch GPU execution errors. `q_gpu`, `k_gpu`, and `v_gpu` are temporary buffers in this prefill path; they are freed before the function returns. In this part of the series, their next consumer is the layer-0 self-attention code described in [the Part 6 self-attention notes](youtubePT6_self_attention_completion.md).
 
 ## What to keep straight while watching
 

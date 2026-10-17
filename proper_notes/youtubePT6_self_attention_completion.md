@@ -1,6 +1,6 @@
-# Finishing the Self-Attention Sublayer — Code Notes for the Upcoming Video
+# Part 6: Finishing the Self-Attention Sublayer
 
-This video has not been published yet. These notes follow the latest layer-0 attention implementation in [`src/main.cpp`](../src/main.cpp) and [`src/kernels.cu`](../src/kernels.cu), and the “Attention” section of [`notes.md`](../notes.md). Start with [the Q/K/V projection notes](youtubePT5_qkv_projection_notes.md) if the three projected buffers are still unfamiliar.
+These notes describe the layer-0 attention implementation shown in [Part 6](https://youtu.be/tTULacSPXkc), before the later MLP and decode changes. The source links to [`src/main.cpp`](../src/main.cpp) and [`src/kernels.cu`](../src/kernels.cu) now point to the newer implementation; use `git show ec066a7:src/main.cpp` and `git show ec066a7:src/kernels.cu` for the Part 6 snapshot. The “Attention” section of [`notes.md`](../notes.md) gives the working explanation. Start with [the Q/K/V projection notes](youtubePT5_qkv_projection_notes.md) if the three projected buffers are still unfamiliar.
 
 ## What we are finishing
 
@@ -14,7 +14,7 @@ probabilities and V -> one weighted value mixture per query head
 old hidden state + attention update -> new hidden state
 ```
 
-That sequence completes the **self-attention sublayer** for layer 0 in this checkout. It does not yet complete the whole Llama decoder layer: the post-attention RMSNorm, gated MLP, and second residual are still to come. Nor does the executable run all 16 layers or produce a next token yet.
+That sequence completes the **self-attention sublayer** for layer 0 at this point in the series. It does not yet complete the whole Llama decoder layer: the post-attention RMSNorm, gated MLP, and second residual are still to come. Nor does the Part 6 executable run all 16 layers or produce a next token yet.
 
 ## Why we needed attention in the first place
 
@@ -189,11 +189,11 @@ project Wo -> output_projection_gpu
 launchResidualAdd -> modifies activations_gpu
 ```
 
-The host checks cuBLAS statuses and CUDA launch results along the way, then synchronizes to catch GPU execution errors. The temporary buffers are freed at the end of `prefill`. At present, the updated `activations_gpu` is also freed rather than passed into a post-attention norm or another layer. The code demonstrates this attention computation, but it does not yet generate text.
+The host checks cuBLAS statuses and CUDA launch results along the way, then synchronizes to catch GPU execution errors. The temporary buffers are freed at the end of `prefill`. In the Part 6 version, the updated `activations_gpu` is also freed rather than passed into a post-attention norm or another layer. That version demonstrates this attention computation, but does not yet generate text.
 
 ## What still makes a full Transformer layer
 
-After the attention residual, Llama's decoder layer continues with a second RMSNorm and a gated feed-forward network: gate and up projections, SiLU on the gate, elementwise gate/up multiplication, down projection, and another residual add. Then the next layer repeats the whole sequence. The current source has pointers to those MLP weights but has not executed that path. This is why “finished self-attention” should not be read as “finished inference engine.”
+After the attention residual, Llama's decoder layer continues with a second RMSNorm and a gated feed-forward network: gate and up projections, SiLU on the gate, elementwise gate/up multiplication, down projection, and another residual add. Then the next layer repeats the whole sequence. The Part 6 source has pointers to those MLP weights but does not execute that path. [Part 7](youtubePT7_feed_forward_swiglu_mlp.md) completes it and predicts the first next token.
 
 If you remember one line from this note, use this one:
 
