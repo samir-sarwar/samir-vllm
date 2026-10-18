@@ -755,3 +755,262 @@ One detail here, if the token we just predicted tells us to stop, we don’t nee
 When the request finishes, our simple implementation frees the K and V allocations. We could also keep an allocation around to use for another request, but then we need to reset the valid length and fill it with the new sequence’s results, we can’t treat the old contents as context for an unrelated prompt.
 This is because the cached vectors depend on the whole prefix leading up to each position. Even if two prompts contain the same word somewhere, that doesn’t mean its cached K and V are interchangeable, because its position and the earlier context may be different.
 Lastly, a useful way to check that we’ve implemented this correctly is to compare a cached decode step against running the full growing sequence again without reusing cached results. They should produce closely matching next-token logits, allowing for floating-point differences, because caching is supposed to reuse the same computations rather than change what the model calculates. Looking at the logits is useful here, since two implementations could pick the same highest-scoring token even if some of their scores are wrong.
+Batching:
+Latency and Throughput:
+So now we’re kinda done no? I mean we’ve gone through all of prefill including writing the whole attention and feed forward networks, across all layers, generated a token and did it repeatedly through decode with the help of the KV cache, meaning effectively it can generate answers, so whats next?
+
+We now want it to be able to serve several users efficiently, the classic software problem of scaling. At the moment its relatively useless considering everythings local, but when we get into turning this into a callable api that we can expose to a frontend and mess with, this becomes a big problem that we should be able to solve.
+
+How we do so, is the fundamental software problem of parallelism/concurrency as we’ve seen so many times at this point. To understand the basics if you are not familiar, two important terms to understand are latency and throughput, lets imagine 3 requests, A,B, and C. If each req takes 5 seconds, then processing them sequentially would mean
+A gets its answer after 5 seconds.
+B gets its answer after 10 seconds.
+C gets its answer after 15 seconds.
+
+Latency would be how long a user waits for their answer, whereas throughput is how many requests or generated tokens the engine completes per second.
+Batching lets the GPU process work from several requests together, making better use of its resources.
+At the moment we’ve implemented single-request decode meaning we process one token per forward pass, i.e from what we’ve talked about earlier after prefill predicts the most likely token we need to run all the same operations including the predicted token and the prompt tokens. The problem is, if we have multiple requests, and due to the fact that prefill is completely parallelized, req B and C might be waiting despite req A not taking nearly close to the max resources of the GPU.
+
+With our two-request batch, we stack A’s and B’s predicted next vectors to run through the operations together. Now a larger matrix operation computes both results. The GPU can reuse weight values across the rows and spread operation-launch overhead over more useful work. Each request still uses its own KV history.
+A quantitative example of how this aids can be shown like this:
+One request: a decode step takes 10 ms, producing 1 token → 100 tokens/second.
+Two requests: a decode step takes 12 ms, producing 2 tokens → about 167 tokens/second.
+As you can see our decode step increased in time by 20% (2ms) meaning our latency, but our throughput increased by 67%. Clearly there is a tradeoff of latency for throughput and vice versa, it is about finding the correct balance for this, and understanding the functional needs of the engine, if latency is not an issue maybe throughput is more prioritized and batching of more requests is implemented in the engine.
+Buffer reuse:
+If you’ve been following along you’d realize we use alot of buffers, which is temporary space on the gpu where we store numbers produced during a computation. Think of it like a scratch pad or a sticky note, or a rough paper before your final answer. Except its hardware worth thousands of dollars LMAO.
+In particular as a token moves through the model, we needed somewhere to put things like hidden state, Q/K/V projections, attention scores and intermediate MLP results. Which are all calculated values from the input.
+One approach would be to free it after everytime its used, but its not like we’re super constricted for VRAM on the GPU, so considering the fact that we need to repeatedly use this scratch paper or temporary gpu space across all 16 transformer layers it doesn’t really make sense to do so. It’s like destroying your scratch paper, and starting on a new one despite the fact you were gonna do the same calculations on that paper. In formal terms, this adds a ton of overhead/wasted time we dont need to do.
+Instead we keep the allocations available:
+Allocate space once
+↓
+Write a result → use it → overwrite it when it's no longer needed
+↓
+Repeat across layers and forward passes
+↓
+Free the space when finished
+We still calculate fresh results each time. The storage is what we reuse, and we only overwrite values after their final reader has finished.
+The KV cache holds information we need for longer. Temporary K/V projection buffers hold newly calculated vectors until we copy them into the request’s cache. That cached history must remain available because future tokens will attend to it as we’ve seen for decode.
+It’s also important to understand that we can’t just reuse buffers willy nilly, there are times when it is safe to do so, and when it isnt. This lies hand in hand with understanding the order of operations in our architecture and how breaking that, or overwriting values early could corrupt everything.
+The general rule is that you can overwrite a buffer once every operation that needs its current values has finished reading them. A “consumer” just means an operation that reads those values. If three people need to copy something from a whiteboard, you have to wait until all three finish before erasing it. Or better said, you have to wait for the data to be consumed from the whiteboard before you use it yourself.
+An example of us re-using buffers in our code can be where we hold query values, Q should stay available while attention uses it to calculate scores, and once attention has finished using every Q row, those queries have now completed their job.
+We can then use that same space for the output projection’s result. That result should survive until the attention residual addition reads it. After that addition finishes, the space becomes available for the MLP down projection. You can see how these 3 are independent of each other, and so by following the correct order we can safely re-use this space in gpu memory. It happens only after the final consumer has read the important data.
+
+Q values
+↓ attention finishes reading Q
+Output-projection result
+↓ residual addition finishes reading it
+MLP down-projection result
+This similar re-use patterns also occur in other parts of the code like with normalized_gpu.
+
+Ok so we keep saying we want to parallelize using batching, but how exactly are we going about that, we cant just spawn threads out of thin air, and how would we be working on two completely different requests at the same time?
+
+Prefill gives us each request’s first predicted token. We can then batch their decode steps because the requests are independent. Their prefills can happen one after another which is what our implementation does.
+Prefill request A → predict token D → save D’s ID
+Prefill request B → predict token R → save R’s ID
+While B runs through prefill, A’s predicted token ID stays stored. Once both are ready, we have the two next tokens to process, so we finish prefill for both before starting to decode.
+For one request, the current decode token has a hidden-state vector containing 2048 numbers, so it takes on the shape of [1,2048]. Lets take a look at the q projection, or creating the Q vector, it would look like multiplying this hidden state vector by the W_q matrix which is [2048,2048] producing q vector of [1,2048]. Now very simply all we do is append a new row to the first requests hidden-state vector with the second requests hidden state vector now creating a matrix. Both rows function independently but we can apply the same matrix multiplications on them so we do so, now getting an output of [2,2048].
+If this still confuses you on how the rows stay independent during this math lets use an example. Instead of 2048, lets shrink it to 2 values.
+Inputs X: Weights Wᵀ:
+[1, 2] ← A [2, 0]
+[3, 4] ← B [1, 3]
+Computing the matrix multiplication:
+A’s output: [1×2 + 2×1, 1×0 + 2×3] = [4, 6]
+B’s output: [3×2 + 4×1, 3×0 + 4×3] = [10, 12]
+Each row uses its own input values and the same learned weights. This multiplication never combines A’s input with B’s input.
+Even though we could calculate those two rows through separate matrix multiplications and get the same mathematical results, combining them gives the GPU more work to perform together and it can spread launch overhead across more rows and reuse weight values while calculating those rows, which can improve overall throughput.
+Decode step walkthrough:
+This next part is definitely a bit more on the verbose side, as it goes through a whole batched decode so you can probably skip, though if you’re having a hard time understanding I do recommend you take a look at this.
+
+We've already seen how we can put multiple requests into different rows of a matrix, but I want to actually follow what happens to those rows through one decode step, because there are parts we can calculate together and then there’s attention, where we still need to go back to each request’s own history.
+Say we’ve run prefill for two requests and we have this:
+Request A:
+Prompt: [A, B, C]
+Predicted next token: D
+Cache length: 3
+Request B:
+Prompt: [J, K, L, M, N]
+Predicted next token: O
+Cache length: 5
+Same idea as our earlier examples, the letters are just standing in for token IDs. We chose D and O, but we still have to actually process them through the model before we can predict what comes after them.
+So the first thing we do is collect those two token IDs together, and we also collect the matching cache pointers in that same order, because later when we calculate D’s key and value we need to know where they belong.
+Token IDs: [D, O]
+Matching caches: [A’s cache, B’s cache]
+Position IDs: [3, 5]
+The positions come from the cache lengths, remember A already has positions 0, 1 and 2 processed, so D goes at position 3. B has five positions processed, so O goes at position 5, even though it happens to be the second token in this little array we’ve made.
+Then we copy the token IDs and positions to the GPU and do the embedding lookup. This is the same thing we did before, use the token ID to find its row in the embedding table, except now we’re gathering two embedding vectors instead of one.
+[D’s embedding vector]
+[O’s embedding vector] Shape: [2, 2048]
+B having a longer prompt doesn’t make its new embedding vector any bigger, it still has 2048 values, its earlier context is sitting in its KV cache. So these two new vectors fit beside each other in the same working matrix just fine.
+Now we enter layer 0, do RMSNorm on each row separately, and use the normalized matrix for the Q, K and V projections. We’ve already covered how those projections work, the difference here is that we’re giving the matrix multiplication two input rows.
+Q: [2, 2048]
+K: [2, 512]
+V: [2, 512]
+The first row in each of those belongs to D and the second belongs to O. Both rows used the same learned weight matrix for that projection, but each result was calculated from its own input vector, so we still have two separate queries, two separate keys and two separate values.
+Next we do RoPE on the new Q and K values, and this is why we bothered collecting the position IDs earlier. D’s query and key get rotated using position 3, O’s get rotated using position 5. The row number tells us where to find the values in our current buffer, whereas the position tells us where that token is in its own sequence, and those are two different things we need to keep track of.
+The old keys in the caches already have their rotations from when we processed them, so we leave them as they are.
+Now we’ve got the new K and V sitting in temporary projection buffers, but future decode steps are going to need them as well, so we copy them into the caches. For D we take row 0, which is 512 values for K and another 512 for V, and put them into A’s cache at position 3 for this layer. O’s values come from row 1 and go into B’s cache at position 5.
+These copies happen GPU to GPU, we’re moving the calculated vectors from the working buffers into the memory we reserved for each request’s history.
+In our code this part happens inside a loop over the active rows, so we copy one request’s K/V and do its attention, then move on to the other request.
+For D, we take its query and calculate attention against A’s cached keys, including the new key we just added for D itself. Then it’s the same GQA mapping, softmax and weighted combination of values we’ve already gone through.
+D attends to: A, B, C, D
+For O, we use its query with B’s keys and values:
+O attends to: J, K, L, M, N, O
+So one attention calculation has four positions available and the other has six. We don’t need to make the requests the same length, each attention call gets the valid number of positions for the cache it’s reading.
+This is also where we keep the two conversations separate, because putting D and O into the same input matrix hasn’t given either of them permission to read the other request’s history. D’s attention only reads A’s cache, and O’s only reads B’s.
+After attention, each request has one 2048-value output vector, and we put those into their corresponding rows:
+[D’s attention output]
+[O’s attention output]
+Shape: [2, 2048]
+Then we can use both rows together for the output projection again, since they’re both being multiplied by the same output-weight matrix. After that we do the residual addition, adding D’s attention update to D’s original hidden state and O’s update to O’s original hidden state.
+The second RMSNorm and MLP follow the same idea. We normalize each row, the gate and up projections each give us [2, 8192], then we do SiLU and the elementwise multiplication we covered before, and the down projection brings the result back to [2, 2048] for the next residual addition.
+So that’s layer 0 done, we have two updated hidden-state vectors and now they go into layer 1, where we repeat this using layer 1’s weights and its section of each request’s cache. Each layer keeps changing the representations in those two rows, and each layer calculates its own new K and V to store.
+D stays at position 3 through all 16 layers, and O stays at position 5. Moving to the next layer doesn’t mean we’ve processed another token, we’re still working on those same two token positions.
+Once we’ve finished all the layers, we do the final RMSNorm and pass both rows through the LM head. That gives us:
+Logits: [2, 128256]
+Row 0: vocabulary scores for what comes after D
+Row 1: vocabulary scores for what comes after O
+Then argmax looks for the highest score separately in each row. Say D’s row picks E and O’s row picks P, we return those two token IDs and update the matching requests with their predictions.
+We also increase each cache’s length once, after the tokens have been processed through all the layers:
+Request A:
+Processed: [A, B, C, D]
+Next token: E
+Cache length: 4
+Request B:
+Processed: [J, K, L, M, N, O]
+Next token: P
+Cache length: 6
+Remember we’ve only chosen E and P here, their keys and values aren’t in the caches yet. If both requests continue generating, the next decode call takes [E, P], looks up their embeddings, and uses positions [4, 6] as it goes through this process again.
+Static Batching:
+So now that we know how batching works, both mathematically and having done a walk through of a code. We can now talk about how theres actually different types of batching. We’ll be looking at 2 in our case, static and dynamic batching.
+So say our inference engine has 2 sequence slots, which means it can keep 2 req active at once, i.e 2 reqs can be batched together. Each occupied slot tracks a request and its KV cache, while additional requests wait in a queue.
+So Imagine A and B have already been prefilled:
+A needs another 2 decode steps.
+B needs another 6 decode steps.
+C is waiting to start.
+Each decode step produces one further token prediction for each active request.
+With static batching, we admit A and B as a group, then wait for that whole group to finish before admitting C. So what that means is here, even though A will finish before B, C will not be admitted into A’s slot until B completes despite it being empty. So for 4 time steps, A is done while B keeps going and C is waiting.
+Decode round: 1 2 3 4 5 6
+Slot 0: A A - - - -
+Slot 1: B B B B B B
+Waiting: C C C C C C
+
+- means the slot is empty
+  As you can see theres evidently a problem in that when response lengths vary, for example a yes or no vs writing an essay the first request finishes way before the second one so a third request has to wait pretty unnecessarily.
+  Continuous Batching:
+  With continuous batching, we check for available slots between decode rounds and fill them from the waiting queue.
+  So going back to our example, Req A still finishes after step 2, but now we admit C into its freed slot before the next decode round, pretty much a better version of what we were doing before with static batching. Diagramatically as so:
+  Decode round: 1 2 3 4 5 6
+  Slot 0: A A C C C C ...
+  Slot 1: B B B B B B
+  ↑
+  C has joined the batch
+  C continues for however many steps it needs while B keeps its existing slot and KV history, so when C joins, we process C’s current token alongside B’s current token. This means batch membership changes during generation and where the extra logic behind developing continuous batching comes into play.
+
+We must develop a scheduler, which is the code that manages batch membership during decode. The scheduler, in between decode steps repeatedly does the following actions:
+Admit waiting requests into available slots, running prefill for each new request.
+Collect the active requests, packing their latest token IDs and matching cache pointers into the decode inputs.
+Run one batched decode step, producing a prediction for each active request.
+Handle completions, checking stop tokens and limits, returning finished responses and releasing their slots.
+Repeat until the waiting queue and all slots are empty.
+The main difference you ought to know between static and continuous batching is that Static batching allows admission when the entire group has finished. Continuous batching allows admission whenever a slot becomes free.
+Req identity
+In our batching implementation theres 3 different things that we need to keep track of:
+
+Request identity: which job this is, such as A or B. Its prompt, generated tokens and token budget belong to that request.
+
+Sequence slot: where that active request’s KV cache and slot assignment are kept. The request holds its slot until it finishes.
+
+Packed batch row: where we put its current token in this particular decode call. We rebuild this arrangement each iteration.
+
+For example, initially A and B might line up like this:
+
+Decode input row 0 → slot 0 → request A
+Decode input row 1 → slot 1 → request B
+
+Btw, at this point it just happens to be that the row and slot matches, this is not always the case. Now say A finishes and suppose B is the only request active for the next call:
+
+Slot 0 → empty
+Slot 1 → request B
+
+When we build the next decode input, we collect only the active requests, placing them next to each other without empty rows. So B becomes the first and only row:
+
+Decode input row 0 → slot 1 → request B
+B’s KV cache stays in slot 1. We’ve simply placed B’s current token at row 0 of the temporary input matrix, and active_slots is what remembers this relationship
+active_slots = [1]
+Meaning: Batch row 0 belongs to sequence slot 1
+The decode call returns predictions in that same row order. If it returns: next_tokens = [42], Token 42 belongs to B. To find its owner, we follow:
+Output row 0
+↓ active_slots[0]
+Slot 1
+↓ slot_requests[1]
+Request B
+Later, another request could take the freed slot 0, and the packed rows could change again. The request keeps its identity while its current batch-row position depends on which other requests are active.
+Finished req slots:
+So now that we can keep multiple requests going together, we also need to know when one of them is actually finished, because otherwise we’d just keep generating tokens and that request would keep holding onto its slot while other requests are waiting.
+One way a request can finish is if the model predicts a special stop token. Our tokenizer has an end-of-turn token and an end-of-sequence token, and if we get either of those we finish the request without adding that token to the response we’re going to display.
+We also have the output-token budget, which is pretty much the maximum number of new tokens we’re allowing that request to generate. So if we ask for 20 new tokens, it can stop earlier if it predicts a stop token, but we won’t let it keep generating past 20.
+Remember though, the first token we predict during prefill is already part of that output. We can’t start counting from the first decode call because we would be leaving out a token we’ve already generated. Say our budget is 3 and we’re using the same example as before:
+Prefill [A, B, C] → predict D
+Generated tokens: [D]
+
+Process D → predict E
+Generated tokens: [D, E]
+
+Process E → predict F
+Generated tokens: [D, E, F]
+At this point we’ve reached the budget, so we finish the request and keep D, E and F as its response. There’s no reason to send F through the model again, we only needed to do that if we wanted to predict something after F. This also comes back to what we said about the cache length, we’ve generated F’s token ID but we haven’t calculated its keys and values.
+The other limit is the context size, which in our engine is 2048 positions. This includes the prompt as well as the generated tokens, so if the prompt already takes up 2040 positions we only have room for another 8, even if the user asked for more than that. We account for this when setting the request’s token budget, taking whichever is smaller out of the requested amount and the space left after the prompt.
+Once any of these stopping conditions is reached, we display the response and release the request’s sequence slot:
+slot_requests[slot] = -1;
+caches[slot].length = 0;
+The -1 tells the scheduler that nobody owns this slot anymore, so it’s available for another request when the batching rules allow one to enter. Then we reset the cache length to zero because the next request starts with none of the old request’s context.
+We’re keeping the actual K and V allocations around though, meaning that space is still reserved on the GPU and we can use it again. Resetting the length only changes how much of that space we consider valid, it doesn’t go through the allocation and erase every number.
+Say the old request had five cached positions, where each box here stands for one position’s cached vectors:
+[old₀, old₁, old₂, old₃, old₄]
+length = 5
+After resetting it, the memory can still look like this:
+[old₀, old₁, old₂, old₃, old₄]
+length = 0
+Those numbers are physically still there, but from the engine’s point of view there is no valid history for the new request yet. Remember attention only gets to read the valid positions we tell it about, we aren’t letting it go through the whole allocation just because the space exists.
+Now say the next request has a two-token prompt. During prefill we calculate its own keys and values and write them into positions 0 and 1 in each layer’s cache:
+[new₀, new₁, old₂, old₃, old₄]
+length = 2
+So now positions 0 and 1 contain the new request’s history, while the old values after that are outside the valid range. They won’t be included in its attention calculations.
+When we process the next token, its new K and V go into position 2 before attention uses that position:
+[new₀, new₁, new₂, old₃, old₄]
+The old values at position 2 have been overwritten by the time we allow attention to read it, and we follow that same order for each new position as the request continues. Positions 3 and 4 can keep their old contents until we need them, because they remain outside the history this request is allowed to use.
+Memory:
+So now that we’re keeping a cache for each active request, we should also look at how much GPU memory we’re actually reserving, because adding another request means we need somewhere to keep its history as well.
+Remember from our earlier calculation, one processed token needs 32 KiB of KV storage across all 16 layers. Our cache capacity is 2048 positions, so for one sequence we reserve:
+2048 × 32 KiB = 64 MiB
+With both sequence-slot caches initialized, that becomes:
+Slot 0: 64 MiB
+Slot 1: 64 MiB
+
+Total reserved KV memory: 128 MiB
+That’s the KV memory specifically, we still have the model weights and the temporary buffers we use during the computations. The weights are shared between the requests, so we load one copy of the model and use those same weight matrices when processing both input rows. Each request needs its own cached results because those depend on its prompt and context.
+There are a couple of counts here that we need to keep separate. The capacity of 2048 tells us how many token positions one cache has space for, whereas its length tells us how many positions contain valid results for the request currently using it.
+Say A has processed 10 tokens and B has processed 20:
+Slot 0:
+Capacity: 2048
+Valid length: 10
+
+Slot 1:
+Capacity: 2048
+Valid length: 20
+We’ve only filled 30 positions across the two caches, but we’ve still reserved the full 128 MiB. We allocated enough space for those sequences to grow, and we keep filling that space as more tokens get processed.
+Then there’s the active request count, which tells us how many slots currently have a request assigned to them. If A finishes and nobody replaces it yet, we only have one active request, but both cache allocations are still there. As we covered before, finishing A resets its valid length and releases its slot, so the next request can use that same allocation.
+This also means having more requests waiting in the queue doesn’t mean we’ve allocated a full KV cache for every one of them. We have space for two active sequences in this setup, and waiting requests get access to those slots as they become available.
+Another thing we need to be specific about is what happens when a new request enters, because so far we’ve mostly been looking at the decode steps where we can put two latest-token vectors into one matrix.
+Our prefill still handles one prompt at a time. At the start, we prefill A, then prefill B, and once their first predicted tokens are ready we can collect those tokens and decode them together.
+The same thing happens when we refill a slot later. Say A finishes while B is still generating, and C is waiting. We admit C into A’s old slot, but C needs its prompt processed before it can join the decode batch, so B waits while that prefill runs.
+Decode A and B
+A finishes
+
+Prefill C
+B waits during this prefill
+
+Decode C and B
+Decode C and B
+...
+B keeps its KV history during that pause, so once C is ready we can continue B from where it left off. If C has a long prompt, though, processing it can create a longer gap between B’s output tokens.
+So when we call this continuous batching, we’re talking about the scheduler checking for freed slots between decode iterations and letting waiting requests enter before the whole previous group has finished. Prefill and decode still run one after another in this implementation, and getting them to overlap is something we can work on separately later.
