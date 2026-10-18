@@ -6,23 +6,28 @@ The series follows what happens between a prompt and a generated token, from loa
 
 ## Build series
 
-| Part 0 | Part 1 |
-| :---: | :---: |
-| [![Part 0: AI inference explained](https://img.youtube.com/vi/ef0mOukUE6U/hqdefault.jpg)](https://youtu.be/ef0mOukUE6U?si=DwP8ENN0enIp4HGy) | [![Part 1: Loading SafeTensor weights](https://img.youtube.com/vi/39_gWVbYgB4/hqdefault.jpg)](https://youtu.be/39_gWVbYgB4?si=cmMyfK0BywNGfd5o) |
-| [AI inference, simply explained](https://youtu.be/ef0mOukUE6U?si=DwP8ENN0enIp4HGy) | [Loading SafeTensor model weights to the GPU](https://youtu.be/39_gWVbYgB4?si=cmMyfK0BywNGfd5o) |
-| Part 2 | Part 3 |
-| [![Part 2: Embedding gather kernel](https://img.youtube.com/vi/0V1lVIzGyqs/hqdefault.jpg)](https://youtu.be/0V1lVIzGyqs?si=Uut4WlzZrYMEpS6R) | [![Part 3: RMSNorm kernel](https://img.youtube.com/vi/my8VrOUVWo0/hqdefault.jpg)](https://youtu.be/my8VrOUVWo0?si=cuge6AsVmI3MfYUM) |
-| [Writing the embedding-table gather kernel](https://youtu.be/0V1lVIzGyqs?si=Uut4WlzZrYMEpS6R) | [Writing the RMSNorm kernel](https://youtu.be/my8VrOUVWo0?si=cuge6AsVmI3MfYUM) |
-| Part 4 | Part 5 |
-| [![Part 4: Rotary Position Embedding (RoPE)](https://img.youtube.com/vi/4gL0hd9UEAY/hqdefault.jpg)](https://youtu.be/4gL0hd9UEAY) | [![Part 5: Q/K/V projections with cuBLAS](https://img.youtube.com/vi/8_HJH7pbw78/hqdefault.jpg)](https://youtu.be/8_HJH7pbw78) |
-| [Rotary Position Embedding (RoPE), explained simply](https://youtu.be/4gL0hd9UEAY) | [Computing Q, K, and V with cuBLAS](https://youtu.be/8_HJH7pbw78) |
-| Part 6 | Part 7 |
-| [![Part 6: Multi-head self-attention](https://img.youtube.com/vi/tTULacSPXkc/hqdefault.jpg)](https://youtu.be/tTULacSPXkc) | [![Part 7: Feed-forward network and SwiGLU](https://img.youtube.com/vi/HjllfB1IPrE/hqdefault.jpg)](https://youtu.be/HjllfB1IPrE) |
-| [Multi-head self-attention](https://youtu.be/tTULacSPXkc) | [Feed-forward network: SwiGLU and MLP](https://youtu.be/HjllfB1IPrE) |
-
-| Part 8 | Part 9 |
-| [![Part 8: Decode and KV cache](https://img.youtube.com/vi/yFwPpH1Hb14/hqdefault.jpg)](https://youtu.be/yFwPpH1Hb14) | [![Part 9: Static and continuous batching](https://img.youtube.com/vi/ei3M0Ex0qHA/hqdefault.jpg)](https://youtu.be/ei3M0Ex0qHA) |
-| [Decode and KV cache, simply explained](https://youtu.be/yFwPpH1Hb14) | [Static and continuous batching](https://youtu.be/ei3M0Ex0qHA) |
+<table width="100%">
+<tr>
+<td align="center" width="50%"><a href="https://youtu.be/ef0mOukUE6U"><img src="https://img.youtube.com/vi/ef0mOukUE6U/maxresdefault.jpg" width="300" alt="Part 0: AI inference explained"><br><strong>Part 0 · AI inference explained</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/39_gWVbYgB4"><img src="https://img.youtube.com/vi/39_gWVbYgB4/maxresdefault.jpg" width="300" alt="Part 1: Loading SafeTensor weights"><br><strong>Part 1 · Loading model weights</strong></a></td>
+</tr>
+<tr>
+<td align="center" width="50%"><a href="https://youtu.be/0V1lVIzGyqs"><img src="https://img.youtube.com/vi/0V1lVIzGyqs/maxresdefault.jpg" width="300" alt="Part 2: Embedding gather kernel"><br><strong>Part 2 · Embedding gather</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/my8VrOUVWo0"><img src="https://img.youtube.com/vi/my8VrOUVWo0/maxresdefault.jpg" width="300" alt="Part 3: RMSNorm kernel"><br><strong>Part 3 · RMSNorm</strong></a></td>
+</tr>
+<tr>
+<td align="center" width="50%"><a href="https://youtu.be/4gL0hd9UEAY"><img src="https://img.youtube.com/vi/4gL0hd9UEAY/maxresdefault.jpg" width="300" alt="Part 4: Rotary position embeddings"><br><strong>Part 4 · RoPE</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/8_HJH7pbw78"><img src="https://img.youtube.com/vi/8_HJH7pbw78/maxresdefault.jpg" width="300" alt="Part 5: Q, K, and V projections with cuBLAS"><br><strong>Part 5 · Q/K/V with cuBLAS</strong></a></td>
+</tr>
+<tr>
+<td align="center" width="50%"><a href="https://youtu.be/tTULacSPXkc"><img src="https://img.youtube.com/vi/tTULacSPXkc/maxresdefault.jpg" width="300" alt="Part 6: Multi-head self-attention"><br><strong>Part 6 · Self-attention</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/HjllfB1IPrE"><img src="https://img.youtube.com/vi/HjllfB1IPrE/maxresdefault.jpg" width="300" alt="Part 7: Feed-forward network and SwiGLU"><br><strong>Part 7 · Feed-forward network</strong></a></td>
+</tr>
+<tr>
+<td align="center" width="50%"><a href="https://youtu.be/yFwPpH1Hb14"><img src="https://img.youtube.com/vi/yFwPpH1Hb14/maxresdefault.jpg" width="300" alt="Part 8: Decode and KV cache"><br><strong>Part 8 · Decode and KV cache</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/ei3M0Ex0qHA"><img src="https://img.youtube.com/vi/ei3M0Ex0qHA/maxresdefault.jpg" width="300" alt="Part 9: Static and continuous batching"><br><strong>Part 9 · Static and continuous batching</strong></a></td>
+</tr>
+</table>
 
 ## What works so far
 
