@@ -61,6 +61,7 @@ constexpr int KV_DIM = 512;
 constexpr int INTERMEDIATE_SIZE = 8192;
 constexpr int VOCAB_SIZE = 128256;
 constexpr int MAX_SEQUENCE_LENGTH = 2048;
+constexpr int BATCH_SIZE = 2;
 constexpr int HEAD_DIM = 64;
 constexpr int NUM_QUERY_HEADS = HIDDEN_SIZE / HEAD_DIM;
 constexpr int NUM_KV_HEADS = KV_DIM / HEAD_DIM;
@@ -307,6 +308,33 @@ struct KVCache
     __nv_bfloat16 *values = nullptr;
     int capacity = 0;
     int length = 0; // Number of tokens actually processed, not predicted.
+};
+
+// Shared by prefill and decode, across all layers and requests.
+struct InferenceBuffers
+{
+    cublasHandle_t cublas_handle = nullptr;
+    int token_capacity = 0;
+    int *token_ids_gpu = nullptr;
+    int *position_ids_gpu = nullptr;
+    int *next_tokens_gpu = nullptr;
+    __nv_bfloat16 *activations_gpu = nullptr;
+    __nv_bfloat16 *normalized_gpu = nullptr;
+    __nv_bfloat16 *projection_gpu = nullptr;
+    __nv_bfloat16 *k_gpu = nullptr;
+    __nv_bfloat16 *v_gpu = nullptr;
+    __nv_bfloat16 *attention_scores_gpu = nullptr;
+    __nv_bfloat16 *gate_gpu = nullptr;
+    __nv_bfloat16 *up_gpu = nullptr;
+    float *logits_gpu = nullptr;
+};
+
+struct Request
+{
+    std::vector<int> prompt_tokens;
+    std::vector<int> generated_tokens;
+    int token_budget = 0;
+    int next_token_id = -1;
 };
 
 int loadLlamaModel(LLamaWeights &weights)
@@ -633,10 +661,32 @@ int initializeKvCache(KVCache &cache, int capacity)
     return 0;
 }
 
+void freeInferenceBuffers(InferenceBuffers &buffers)
+{
+    cudaFree(buffers.token_ids_gpu);
+    cudaFree(buffers.position_ids_gpu);
+    cudaFree(buffers.next_tokens_gpu);
+    cudaFree(buffers.activations_gpu);
+    cudaFree(buffers.normalized_gpu);
+    cudaFree(buffers.projection_gpu);
+    cudaFree(buffers.k_gpu);
+    cudaFree(buffers.v_gpu);
+    cudaFree(buffers.attention_scores_gpu);
+    cudaFree(buffers.gate_gpu);
+    cudaFree(buffers.up_gpu);
+    cudaFree(buffers.logits_gpu);
+    if (buffers.cublas_handle != nullptr)
+    {
+        cublasDestroy(buffers.cublas_handle);
+    }
+    buffers = InferenceBuffers{};
+}
+
 int prefill(
     const std::vector<int> &token_ids,
     LLamaWeights &weights,
     KVCache &cache,
+    InferenceBuffers &buffers,
     const float *cos_table_gpu,
     const float *sin_table_gpu,
     int &next_token_id,
@@ -645,6 +695,7 @@ int prefill(
     cache.length = 0; // A new prompt replaces the previous sequence.
     if (token_ids.empty() ||
         token_ids.size() > MAX_SEQUENCE_LENGTH ||
+        token_ids.size() > static_cast<size_t>(buffers.token_capacity) ||
         cache.keys == nullptr || cache.values == nullptr ||
         cache.capacity <= 0 || cache.capacity > MAX_SEQUENCE_LENGTH ||
         token_ids.size() > static_cast<size_t>(cache.capacity) ||
@@ -658,46 +709,30 @@ int prefill(
     }
 
     const int token_count = static_cast<int>(token_ids.size());
-    int *token_id_gpu = nullptr;
-    int *position_ids_gpu = nullptr;
-    __nv_bfloat16 *activations_gpu = nullptr;
-    __nv_bfloat16 *normalized_gpu = nullptr;
-    __nv_bfloat16 *q_gpu = nullptr;
-    __nv_bfloat16 *k_gpu = nullptr;
-    __nv_bfloat16 *v_gpu = nullptr;
-    __nv_bfloat16 *attention_scores_gpu = nullptr;
+    int *&token_id_gpu = buffers.token_ids_gpu;
+    int *&position_ids_gpu = buffers.position_ids_gpu;
+    __nv_bfloat16 *&activations_gpu = buffers.activations_gpu;
+    __nv_bfloat16 *&normalized_gpu = buffers.normalized_gpu;
+    __nv_bfloat16 *&q_gpu = buffers.projection_gpu;
+    __nv_bfloat16 *&k_gpu = buffers.k_gpu;
+    __nv_bfloat16 *&v_gpu = buffers.v_gpu;
+    __nv_bfloat16 *&attention_scores_gpu = buffers.attention_scores_gpu;
     __nv_bfloat16 *attention_output_gpu = nullptr;
     __nv_bfloat16 *output_projection_gpu = nullptr;
-    __nv_bfloat16 *gate_gpu = nullptr;
-    __nv_bfloat16 *up_gpu = nullptr;
-    float *logits_gpu = nullptr;
-    int *next_token_gpu = nullptr;
-    cublasHandle_t cublas_handle = nullptr;
+    __nv_bfloat16 *&gate_gpu = buffers.gate_gpu;
+    __nv_bfloat16 *&up_gpu = buffers.up_gpu;
+    float *&logits_gpu = buffers.logits_gpu;
+    int *&next_token_gpu = buffers.next_tokens_gpu;
+    cublasHandle_t &cublas_handle = buffers.cublas_handle;
 
     auto free_prefill_buffers = [&]()
     {
-        cudaFree(token_id_gpu);
-        cudaFree(position_ids_gpu);
-        cudaFree(activations_gpu);
-        cudaFree(normalized_gpu);
-        if (cublas_handle != nullptr)
-        {
-            cublasDestroy(cublas_handle);
-        }
-
-        cudaFree(q_gpu);
-        cudaFree(k_gpu);
-        cudaFree(v_gpu);
-        cudaFree(attention_scores_gpu);
-        cudaFree(attention_output_gpu);
-        cudaFree(output_projection_gpu);
-        cudaFree(gate_gpu);
-        cudaFree(up_gpu);
-        cudaFree(logits_gpu);
-        cudaFree(next_token_gpu);
+        freeInferenceBuffers(buffers);
     };
 
-    if (cudaMalloc(&token_id_gpu, token_ids.size() * sizeof(int)) != 0)
+    // Allocate on the first prefill, then keep these buffers for every request.
+    if (token_id_gpu == nullptr &&
+        cudaMalloc(&token_id_gpu, buffers.token_capacity * sizeof(int)) != 0)
     {
         std::cerr << "gpu token mem allocation failed";
         return -1;
@@ -712,9 +747,8 @@ int prefill(
     std::vector<int> position_ids_cpu(token_count);
     std::iota(position_ids_cpu.begin(), position_ids_cpu.end(), 0);
 
-    if (cudaMalloc(
-            &position_ids_gpu,
-            position_ids_cpu.size() * sizeof(int)) != cudaSuccess)
+    if (position_ids_gpu == nullptr &&
+        cudaMalloc(&position_ids_gpu, buffers.token_capacity * sizeof(int)) != cudaSuccess)
     {
         std::cerr << "gpu position ID allocation failed\n";
         free_prefill_buffers();
@@ -732,7 +766,8 @@ int prefill(
         return -1;
     }
 
-    if (cudaMalloc(&activations_gpu, token_ids.size() * 2048 * sizeof(__nv_bfloat16)) != 0)
+    if (activations_gpu == nullptr &&
+        cudaMalloc(&activations_gpu, static_cast<size_t>(buffers.token_capacity) * 2048 * sizeof(__nv_bfloat16)) != 0)
     {
         std::cerr << "gpu activation token mem allocation failed";
         free_prefill_buffers();
@@ -751,11 +786,12 @@ int prefill(
     }
 
     const size_t activation_bytes =
-        static_cast<size_t>(token_count) *
+        static_cast<size_t>(buffers.token_capacity) *
         2048 *
         sizeof(__nv_bfloat16);
 
-    if (cudaMalloc(&normalized_gpu, activation_bytes) != cudaSuccess)
+    if (normalized_gpu == nullptr &&
+        cudaMalloc(&normalized_gpu, activation_bytes) != cudaSuccess)
     {
         std::cerr << "gpu RMSNorm output allocation failed\n";
         free_prefill_buffers();
@@ -764,11 +800,11 @@ int prefill(
 
     // Scratch buffers are reused by every layer.
     const size_t mlp_bytes =
-        static_cast<size_t>(token_count) *
+        static_cast<size_t>(buffers.token_capacity) *
         INTERMEDIATE_SIZE *
         sizeof(__nv_bfloat16);
-    if (cudaMalloc(&gate_gpu, mlp_bytes) != cudaSuccess ||
-        cudaMalloc(&up_gpu, mlp_bytes) != cudaSuccess)
+    if ((gate_gpu == nullptr && cudaMalloc(&gate_gpu, mlp_bytes) != cudaSuccess) ||
+        (up_gpu == nullptr && cudaMalloc(&up_gpu, mlp_bytes) != cudaSuccess))
     {
         std::cerr << "MLP buffer allocation failed\n";
         free_prefill_buffers();
@@ -801,7 +837,7 @@ int prefill(
     }
 
     const size_t q_bytes =
-        static_cast<size_t>(token_count) *
+        static_cast<size_t>(buffers.token_capacity) *
         HIDDEN_SIZE *
         sizeof(__nv_bfloat16);
 
@@ -810,18 +846,21 @@ int prefill(
         KV_DIM *
         sizeof(__nv_bfloat16);
 
+    const size_t kv_buffer_bytes =
+        static_cast<size_t>(buffers.token_capacity) * KV_DIM * sizeof(__nv_bfloat16);
+
     // Create Q/K/V buffers and the cuBLAS handle once, then reuse them.
     if (layer == 0 &&
-        (cudaMalloc(&q_gpu, q_bytes) != cudaSuccess ||
-         cudaMalloc(&k_gpu, kv_bytes) != cudaSuccess ||
-         cudaMalloc(&v_gpu, kv_bytes) != cudaSuccess))
+        ((q_gpu == nullptr && cudaMalloc(&q_gpu, q_bytes) != cudaSuccess) ||
+         (k_gpu == nullptr && cudaMalloc(&k_gpu, kv_buffer_bytes) != cudaSuccess) ||
+         (v_gpu == nullptr && cudaMalloc(&v_gpu, kv_buffer_bytes) != cudaSuccess)))
     {
         std::cerr << "Q/K/V buffer allocation failed\n";
         free_prefill_buffers();
         return -1;
     }
 
-    if (layer == 0 && cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
+    if (layer == 0 && cublas_handle == nullptr && cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
     {
         std::cerr << "cuBLAS initialization failed\n";
         free_prefill_buffers();
@@ -902,15 +941,17 @@ int prefill(
     // matrix and maps to KV head query_head / 4.
     const size_t attention_score_bytes =
         static_cast<size_t>(NUM_QUERY_HEADS) *
-        token_count *
-        token_count *
+        std::max(static_cast<size_t>(buffers.token_capacity) * buffers.token_capacity,
+                 static_cast<size_t>(MAX_SEQUENCE_LENGTH)) *
         sizeof(__nv_bfloat16);
 
-    // Attention scratch has the same shape in every layer.
-    if (layer == 0 &&
-        (cudaMalloc(&attention_scores_gpu, attention_score_bytes) != cudaSuccess ||
-         cudaMalloc(&attention_output_gpu, activation_bytes) != cudaSuccess ||
-         cudaMalloc(&output_projection_gpu, activation_bytes) != cudaSuccess))
+    // Q/K/V have consumed the norm; Q is consumed before the output projection.
+    attention_output_gpu = normalized_gpu;
+    output_projection_gpu = q_gpu;
+
+    // Attention scratch has the same shape in every layer and covers long decode.
+    if (layer == 0 && attention_scores_gpu == nullptr &&
+        cudaMalloc(&attention_scores_gpu, attention_score_bytes) != cudaSuccess)
     {
         std::cerr << "attention buffer allocation failed\n";
         free_prefill_buffers();
@@ -1072,8 +1113,10 @@ int prefill(
         return -1;
     }
 
-    if (cudaMalloc(&logits_gpu, VOCAB_SIZE * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&next_token_gpu, sizeof(int)) != cudaSuccess)
+    if ((logits_gpu == nullptr &&
+         cudaMalloc(&logits_gpu, BATCH_SIZE * VOCAB_SIZE * sizeof(float)) != cudaSuccess) ||
+        (next_token_gpu == nullptr &&
+         cudaMalloc(&next_token_gpu, BATCH_SIZE * sizeof(int)) != cudaSuccess))
     {
         std::cerr << "LM head buffer allocation failed\n";
         free_prefill_buffers();
@@ -1112,173 +1155,154 @@ int prefill(
         }
     }
     cache.length = token_count;
-    free_prefill_buffers();
     return 0;
 }
 
-// Decode processes one token. Its query attends to all cached positions.
+// Decode processes one token per active sequence, each with its own cached prefix.
 int decode(
-    int token_id,
+    const std::vector<int> &token_ids,
     LLamaWeights &weights,
-    KVCache &cache,
+    const std::vector<KVCache *> &caches,
+    InferenceBuffers &buffers,
     const float *cos_table_gpu,
     const float *sin_table_gpu,
-    int &next_token_id,
+    std::vector<int> &next_token_ids,
     std::vector<float> *logits_cpu = nullptr)
 {
-    if (cache.keys == nullptr || cache.values == nullptr ||
-        cache.capacity <= 0 || cache.capacity > MAX_SEQUENCE_LENGTH ||
-        cache.length <= 0 || cache.length >= cache.capacity ||
-        token_id < 0 || token_id >= VOCAB_SIZE ||
+    const int token_count = static_cast<int>(token_ids.size());
+    if (token_count <= 0 || token_count > BATCH_SIZE ||
+        token_count > buffers.token_capacity || token_ids.size() != caches.size() ||
+        buffers.cublas_handle == nullptr ||
         cos_table_gpu == nullptr || sin_table_gpu == nullptr)
     {
-        std::cerr << "invalid decode input or KV cache is empty/full\n";
+        std::cerr << "invalid decode input\n";
         return -1;
     }
-
-    const int position = cache.length;
-    const int key_count = position + 1;
-    int *token_id_gpu = nullptr;
-    int *position_ids_gpu = nullptr;
-    int *next_token_gpu = nullptr;
-    __nv_bfloat16 *activations_gpu = nullptr;
-    __nv_bfloat16 *normalized_gpu = nullptr;
-    __nv_bfloat16 *q_gpu = nullptr;
-    __nv_bfloat16 *attention_scores_gpu = nullptr;
-    __nv_bfloat16 *attention_output_gpu = nullptr;
-    __nv_bfloat16 *output_projection_gpu = nullptr;
-    __nv_bfloat16 *gate_gpu = nullptr;
-    __nv_bfloat16 *up_gpu = nullptr;
-    float *logits_gpu = nullptr;
-    cublasHandle_t cublas_handle = nullptr;
-
-    auto free_decode_buffers = [&]()
+    std::vector<int> position_ids_cpu(token_count);
+    for (int row = 0; row < token_count; ++row)
     {
-        cudaFree(token_id_gpu);
-        cudaFree(position_ids_gpu);
-        cudaFree(next_token_gpu);
-        cudaFree(activations_gpu);
-        cudaFree(normalized_gpu);
-        cudaFree(q_gpu);
-        cudaFree(attention_scores_gpu);
-        cudaFree(attention_output_gpu);
-        cudaFree(output_projection_gpu);
-        cudaFree(gate_gpu);
-        cudaFree(up_gpu);
-        cudaFree(logits_gpu);
-        if (cublas_handle != nullptr)
+        const KVCache *cache = caches[row];
+        if (cache == nullptr || cache->keys == nullptr || cache->values == nullptr ||
+            cache->capacity <= 0 || cache->capacity > MAX_SEQUENCE_LENGTH ||
+            cache->length <= 0 || cache->length >= cache->capacity ||
+            token_ids[row] < 0 || token_ids[row] >= VOCAB_SIZE)
         {
-            cublasDestroy(cublas_handle);
+            std::cerr << "invalid decode token or KV cache is empty/full\n";
+            return -1;
         }
-    };
-
-    // Every activation/projection has just one token row. Scores have one
-    // row per query head, but each row still covers the entire cached prefix.
-    const size_t activation_bytes = HIDDEN_SIZE * sizeof(__nv_bfloat16);
-    const size_t mlp_bytes = INTERMEDIATE_SIZE * sizeof(__nv_bfloat16);
-    const size_t score_bytes = NUM_QUERY_HEADS * key_count * sizeof(__nv_bfloat16);
-    if (cudaMalloc(&token_id_gpu, sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&position_ids_gpu, sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&next_token_gpu, sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&activations_gpu, activation_bytes) != cudaSuccess ||
-        cudaMalloc(&normalized_gpu, activation_bytes) != cudaSuccess ||
-        cudaMalloc(&q_gpu, activation_bytes) != cudaSuccess ||
-        cudaMalloc(&attention_scores_gpu, score_bytes) != cudaSuccess ||
-        cudaMalloc(&attention_output_gpu, activation_bytes) != cudaSuccess ||
-        cudaMalloc(&output_projection_gpu, activation_bytes) != cudaSuccess ||
-        cudaMalloc(&gate_gpu, mlp_bytes) != cudaSuccess ||
-        cudaMalloc(&up_gpu, mlp_bytes) != cudaSuccess ||
-        cudaMalloc(&logits_gpu, VOCAB_SIZE * sizeof(float)) != cudaSuccess ||
-        cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
-    {
-        std::cerr << "decode buffer allocation or cuBLAS initialization failed\n";
-        free_decode_buffers();
-        return -1;
+        position_ids_cpu[row] = cache->length;
     }
+
+    int *token_id_gpu = buffers.token_ids_gpu;
+    int *position_ids_gpu = buffers.position_ids_gpu;
+    __nv_bfloat16 *activations_gpu = buffers.activations_gpu;
+    __nv_bfloat16 *normalized_gpu = buffers.normalized_gpu;
+    // Q is consumed before the output and MLP down projections reuse its buffer.
+    __nv_bfloat16 *q_gpu = buffers.projection_gpu;
+    __nv_bfloat16 *k_gpu = buffers.k_gpu;
+    __nv_bfloat16 *v_gpu = buffers.v_gpu;
+    __nv_bfloat16 *attention_scores_gpu = buffers.attention_scores_gpu;
+    // Q/K/V have consumed the norm before attention writes into its buffer.
+    __nv_bfloat16 *attention_output_gpu = buffers.normalized_gpu;
+    __nv_bfloat16 *output_projection_gpu = buffers.projection_gpu;
+    __nv_bfloat16 *gate_gpu = buffers.gate_gpu;
+    __nv_bfloat16 *up_gpu = buffers.up_gpu;
+    float *logits_gpu = buffers.logits_gpu;
+    int *next_token_gpu = buffers.next_tokens_gpu;
+    cublasHandle_t cublas_handle = buffers.cublas_handle;
 
     // Position is the absolute sequence position, not zero for each step.
-    if (cudaMemcpy(token_id_gpu, &token_id, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(position_ids_gpu, &position, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess ||
-        launchEmbeddingGather(token_id_gpu, weights.embed_tokens, activations_gpu, 1) != cudaSuccess)
+    if (cudaMemcpy(token_id_gpu, token_ids.data(), token_count * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(position_ids_gpu, position_ids_cpu.data(), token_count * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess ||
+        launchEmbeddingGather(token_id_gpu, weights.embed_tokens, activations_gpu, token_count) != cudaSuccess)
     {
         std::cerr << "decode token/position upload or embedding failed\n";
-        free_decode_buffers();
         return -1;
     }
 
     for (int layer = 0; layer < N_LAYERS; ++layer)
     {
-        const size_t layer_offset = static_cast<size_t>(layer) * cache.capacity * KV_DIM;
-        __nv_bfloat16 *layer_keys = cache.keys + layer_offset;
-        __nv_bfloat16 *layer_values = cache.values + layer_offset;
-        __nv_bfloat16 *new_key = layer_keys + static_cast<size_t>(position) * KV_DIM;
-        __nv_bfloat16 *new_value = layer_values + static_cast<size_t>(position) * KV_DIM;
-
-        // Project only the new token. K/V write into the next cache slot.
+        // Project all active tokens together, then scatter their K/V rows.
         if (launchRmsNorm(activations_gpu, normalized_gpu,
-                          weights.input_layernorm[layer], 1) != cudaSuccess ||
+                          weights.input_layernorm[layer], token_count) != cudaSuccess ||
             projectBf16RowMajor(cublas_handle, normalized_gpu, weights.w_q[layer],
-                               q_gpu, 1, HIDDEN_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
+                               q_gpu, token_count, HIDDEN_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
             projectBf16RowMajor(cublas_handle, normalized_gpu, weights.w_k[layer],
-                               new_key, 1, HIDDEN_SIZE, KV_DIM) != CUBLAS_STATUS_SUCCESS ||
+                               k_gpu, token_count, HIDDEN_SIZE, KV_DIM) != CUBLAS_STATUS_SUCCESS ||
             projectBf16RowMajor(cublas_handle, normalized_gpu, weights.w_v[layer],
-                               new_value, 1, HIDDEN_SIZE, KV_DIM) != CUBLAS_STATUS_SUCCESS)
+                               v_gpu, token_count, HIDDEN_SIZE, KV_DIM) != CUBLAS_STATUS_SUCCESS)
         {
             std::cerr << "decode RMSNorm or Q/K/V projection failed\n";
-            free_decode_buffers();
             return -1;
         }
 
         // Rotate only the new Q/K. Old cached keys are already rotated.
         if (launchRope(q_gpu, position_ids_gpu, cos_table_gpu, sin_table_gpu,
-                       1, HIDDEN_SIZE, HEAD_DIM) != cudaSuccess ||
-            launchRope(new_key, position_ids_gpu, cos_table_gpu, sin_table_gpu,
-                       1, KV_DIM, HEAD_DIM) != cudaSuccess)
+                       token_count, HIDDEN_SIZE, HEAD_DIM) != cudaSuccess ||
+            launchRope(k_gpu, position_ids_gpu, cos_table_gpu, sin_table_gpu,
+                       token_count, KV_DIM, HEAD_DIM) != cudaSuccess)
         {
             std::cerr << "decode RoPE failed\n";
-            free_decode_buffers();
             return -1;
         }
 
-        // All stored positions are earlier than this query or are the token
-        // itself. There are no future positions, so decode needs no mask.
-        if (computeGqaAttentionScores(cublas_handle, q_gpu, layer_keys,
-                                      attention_scores_gpu, 1, key_count) != CUBLAS_STATUS_SUCCESS ||
-            launchStableSoftmax(attention_scores_gpu, 1, NUM_QUERY_HEADS,
-                                key_count) != cudaSuccess ||
-            mixGqaValues(cublas_handle, attention_scores_gpu, layer_values,
-                         attention_output_gpu, 1, key_count) != CUBLAS_STATUS_SUCCESS)
+        for (int row = 0; row < token_count; ++row)
         {
-            std::cerr << "decode attention failed\n";
-            free_decode_buffers();
-            return -1;
+            KVCache &cache = *caches[row];
+            const int position = cache.length;
+            const int key_count = position + 1;
+            const size_t layer_offset = static_cast<size_t>(layer) * cache.capacity * KV_DIM;
+            __nv_bfloat16 *layer_keys = cache.keys + layer_offset;
+            __nv_bfloat16 *layer_values = cache.values + layer_offset;
+            __nv_bfloat16 *new_key = layer_keys + static_cast<size_t>(position) * KV_DIM;
+            __nv_bfloat16 *new_value = layer_values + static_cast<size_t>(position) * KV_DIM;
+
+            if (cudaMemcpy(new_key, k_gpu + row * KV_DIM, KV_DIM * sizeof(__nv_bfloat16),
+                           cudaMemcpyDeviceToDevice) != cudaSuccess ||
+                cudaMemcpy(new_value, v_gpu + row * KV_DIM, KV_DIM * sizeof(__nv_bfloat16),
+                           cudaMemcpyDeviceToDevice) != cudaSuccess)
+            {
+                std::cerr << "decode KV cache copy failed\n";
+                return -1;
+            }
+
+            // Each query attends only to its sequence's processed positions.
+            // There are no future positions, so decode needs no mask.
+            if (computeGqaAttentionScores(cublas_handle, q_gpu + row * HIDDEN_SIZE, layer_keys,
+                                          attention_scores_gpu, 1, key_count) != CUBLAS_STATUS_SUCCESS ||
+                launchStableSoftmax(attention_scores_gpu, 1, NUM_QUERY_HEADS,
+                                    key_count) != cudaSuccess ||
+                mixGqaValues(cublas_handle, attention_scores_gpu, layer_values,
+                             attention_output_gpu + row * HIDDEN_SIZE, 1, key_count) != CUBLAS_STATUS_SUCCESS)
+            {
+                std::cerr << "decode attention failed\n";
+                return -1;
+            }
         }
 
         if (projectBf16RowMajor(cublas_handle, attention_output_gpu, weights.w_o[layer],
-                               output_projection_gpu, 1, HIDDEN_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
-            launchResidualAdd(activations_gpu, output_projection_gpu, 1, HIDDEN_SIZE) != cudaSuccess ||
+                               output_projection_gpu, token_count, HIDDEN_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
+            launchResidualAdd(activations_gpu, output_projection_gpu, token_count, HIDDEN_SIZE) != cudaSuccess ||
             launchRmsNorm(activations_gpu, normalized_gpu,
-                          weights.post_attn_layernorms[layer], 1) != cudaSuccess)
+                          weights.post_attn_layernorms[layer], token_count) != cudaSuccess)
         {
             std::cerr << "decode attention residual or post-attention norm failed\n";
-            free_decode_buffers();
             return -1;
         }
 
         const cublasStatus_t gate_status = projectBf16RowMajor(
             cublas_handle, normalized_gpu, weights.mlp_gate_proj[layer],
-            gate_gpu, 1, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+            gate_gpu, token_count, HIDDEN_SIZE, INTERMEDIATE_SIZE);
         const cublasStatus_t up_status = projectBf16RowMajor(
             cublas_handle, normalized_gpu, weights.mlp_up_proj[layer],
-            up_gpu, 1, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+            up_gpu, token_count, HIDDEN_SIZE, INTERMEDIATE_SIZE);
         if (gate_status != CUBLAS_STATUS_SUCCESS || up_status != CUBLAS_STATUS_SUCCESS ||
-            launchSwiGlu(gate_gpu, up_gpu, 1, INTERMEDIATE_SIZE) != cudaSuccess ||
+            launchSwiGlu(gate_gpu, up_gpu, token_count, INTERMEDIATE_SIZE) != cudaSuccess ||
             projectBf16RowMajor(cublas_handle, gate_gpu, weights.mlp_down_proj[layer],
-                               output_projection_gpu, 1, INTERMEDIATE_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
-            launchResidualAdd(activations_gpu, output_projection_gpu, 1, HIDDEN_SIZE) != cudaSuccess)
+                               output_projection_gpu, token_count, INTERMEDIATE_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
+            launchResidualAdd(activations_gpu, output_projection_gpu, token_count, HIDDEN_SIZE) != cudaSuccess)
         {
             std::cerr << "decode MLP or residual failed\n";
-            free_decode_buffers();
             return -1;
         }
         const cudaError_t execution_error = cudaDeviceSynchronize();
@@ -1286,41 +1310,184 @@ int decode(
         {
             std::cerr << "decode execution failed in layer " << layer << ": "
                       << cudaGetErrorString(execution_error) << '\n';
-            free_decode_buffers();
             return -1;
         }
     }
 
+    next_token_ids.resize(token_count);
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    if (launchRmsNorm(activations_gpu, normalized_gpu, weights.norm, 1) != cudaSuccess ||
+    if (launchRmsNorm(activations_gpu, normalized_gpu, weights.norm, token_count) != cudaSuccess ||
         cublasGemmEx(
             cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            VOCAB_SIZE, 1, HIDDEN_SIZE,
+            VOCAB_SIZE, token_count, HIDDEN_SIZE,
             &alpha, weights.lm_head, CUDA_R_16BF, HIDDEN_SIZE,
             normalized_gpu, CUDA_R_16BF, HIDDEN_SIZE,
             &beta, logits_gpu, CUDA_R_32F, VOCAB_SIZE,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS ||
-        launchArgmax(logits_gpu, next_token_gpu, VOCAB_SIZE) != cudaSuccess ||
-        cudaMemcpy(&next_token_id, next_token_gpu, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess)
+        launchArgmax(logits_gpu, next_token_gpu, VOCAB_SIZE, token_count) != cudaSuccess ||
+        cudaMemcpy(next_token_ids.data(), next_token_gpu, token_count * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess)
     {
         std::cerr << "decode final norm, LM head, or argmax failed\n";
-        free_decode_buffers();
         return -1;
     }
     if (logits_cpu != nullptr)
     {
-        logits_cpu->resize(VOCAB_SIZE);
-        if (cudaMemcpy(logits_cpu->data(), logits_gpu, VOCAB_SIZE * sizeof(float),
+        logits_cpu->resize(static_cast<size_t>(token_count) * VOCAB_SIZE);
+        if (cudaMemcpy(logits_cpu->data(), logits_gpu, logits_cpu->size() * sizeof(float),
                        cudaMemcpyDeviceToHost) != cudaSuccess)
         {
             std::cerr << "decode logit copy failed\n";
-            free_decode_buffers();
             return -1;
         }
     }
-    cache.length = key_count;
-    free_decode_buffers();
+    for (KVCache *cache : caches)
+    {
+        ++cache->length;
+    }
+    return 0;
+}
+
+int generateRequests(
+    std::vector<Request> &requests,
+    LLamaWeights &weights,
+    InferenceBuffers &buffers,
+    Tokenizer &tokenizer,
+    const float *cos_table_gpu,
+    const float *sin_table_gpu,
+    bool continuous_batching)
+{
+    KVCache caches[BATCH_SIZE]{};
+    int slot_requests[BATCH_SIZE];
+    std::fill_n(slot_requests, BATCH_SIZE, -1);
+    std::queue<int> pending;
+    for (int request = 0; request < static_cast<int>(requests.size()); ++request)
+    {
+        pending.push(request);
+    }
+    auto free_caches = [&]()
+    {
+        for (KVCache &cache : caches)
+        {
+            freeKvCache(cache);
+        }
+    };
+    for (int slot = 0; slot < BATCH_SIZE && slot < static_cast<int>(requests.size()); ++slot)
+    {
+        if (initializeKvCache(caches[slot], MAX_SEQUENCE_LENGTH) != 0)
+        {
+            free_caches();
+            return -1;
+        }
+    }
+
+    // Consume predictions from both prefill and decode in exactly the same way.
+    auto accept_token = [&](int slot)
+    {
+        const int request_index = slot_requests[slot];
+        Request &request = requests[request_index];
+        const bool stop = request.next_token_id == tokenizer.eot_id() ||
+                          request.next_token_id == tokenizer.eos_id();
+        if (!stop)
+        {
+            request.generated_tokens.push_back(request.next_token_id);
+        }
+        if (!stop && static_cast<int>(request.generated_tokens.size()) < request.token_budget)
+        {
+            return;
+        }
+
+        if (requests.size() > 1)
+        {
+            std::cout << "Request " << request_index + 1 << ":\n";
+        }
+        // Decode the full byte sequence so split UTF-8 tokens join correctly.
+        std::cout << "Response: " << tokenizer.decode(request.generated_tokens) << '\n';
+        std::cout << "Generated token IDs:";
+        for (int token : request.generated_tokens)
+        {
+            std::cout << ' ' << token;
+        }
+        std::cout << '\n';
+        if (!stop && request.prompt_tokens.size() + request.generated_tokens.size() == MAX_SEQUENCE_LENGTH)
+        {
+            std::cout << "Stopped at the context limit.\n";
+        }
+        slot_requests[slot] = -1;
+        caches[slot].length = 0; // Old bytes are ignored and overwritten on reuse.
+    };
+
+    std::vector<int> active_slots, active_tokens, next_tokens;
+    std::vector<KVCache *> active_caches;
+    active_slots.reserve(BATCH_SIZE);
+    active_tokens.reserve(BATCH_SIZE);
+    next_tokens.reserve(BATCH_SIZE);
+    active_caches.reserve(BATCH_SIZE);
+    while (true)
+    {
+        const bool batch_empty = std::all_of(
+            slot_requests, slot_requests + BATCH_SIZE, [](int request)
+            { return request == -1; });
+        // Static batches wait for the entire group. Continuous batches refill now.
+        if (continuous_batching || batch_empty)
+        {
+            for (int slot = 0; slot < BATCH_SIZE; ++slot)
+            {
+                while (slot_requests[slot] == -1 && !pending.empty())
+                {
+                    const int request_index = pending.front();
+                    pending.pop();
+                    slot_requests[slot] = request_index;
+                    Request &request = requests[request_index];
+                    if (prefill(request.prompt_tokens, weights, caches[slot], buffers,
+                                cos_table_gpu, sin_table_gpu, request.next_token_id) != 0)
+                    {
+                        free_caches();
+                        return -1;
+                    }
+                    accept_token(slot); // The first generated token counts toward the budget.
+                    if (!continuous_batching)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        active_slots.clear();
+        active_tokens.clear();
+        active_caches.clear();
+        for (int slot = 0; slot < BATCH_SIZE; ++slot)
+        {
+            if (slot_requests[slot] != -1)
+            {
+                active_slots.push_back(slot);
+                active_tokens.push_back(requests[slot_requests[slot]].next_token_id);
+                active_caches.push_back(&caches[slot]);
+            }
+        }
+        if (active_slots.empty())
+        {
+            if (pending.empty())
+            {
+                break;
+            }
+            continue;
+        }
+        if (decode(active_tokens, weights, active_caches, buffers,
+                   cos_table_gpu, sin_table_gpu, next_tokens) != 0)
+        {
+            free_caches();
+            return -1;
+        }
+        for (int row = 0; row < static_cast<int>(active_slots.size()); ++row)
+        {
+            const int slot = active_slots[row];
+            requests[slot_requests[slot]].next_token_id = next_tokens[row];
+            accept_token(slot);
+        }
+    }
+    free_caches();
     return 0;
 }
 
@@ -1328,22 +1495,30 @@ int decode(
 int main(int argc, char **argv)
 {
     // checkGPUStatus();
+    int first_arg = 1;
+    bool continuous_batching = true;
+    if (argc > 1 && (std::strcmp(argv[1], "--static") == 0 ||
+                     std::strcmp(argv[1], "--continuous") == 0))
+    {
+        continuous_batching = std::strcmp(argv[1], "--static") != 0;
+        ++first_arg;
+    }
+    if (argc > first_arg && std::strcmp(argv[first_arg], "--help") == 0)
+    {
+        std::cout << "Usage: samir-vllm [--static|--continuous] [prompt] [max_new_tokens] [extra_prompt ...]\n";
+        return 0;
+    }
     LLamaWeights weights{};
-    const std::string prompt = argc > 1 ? argv[1] : "Hello World!";
+    const std::string prompt = argc > first_arg ? argv[first_arg] : "Hello World!";
     const std::string tokenizer_path = "models/llama-3.2-1b-instruct/tokenizer.model";
     int max_new_tokens = 128;
-    if (argc > 3)
-    {
-        std::cerr << "Usage: samir-vllm [prompt] [max_new_tokens]\n";
-        return -1;
-    }
-    if (argc > 2)
+    if (argc > first_arg + 1)
     {
         try
         {
             size_t parsed = 0;
-            max_new_tokens = std::stoi(argv[2], &parsed);
-            if (parsed != std::strlen(argv[2]) || max_new_tokens <= 0 ||
+            max_new_tokens = std::stoi(argv[first_arg + 1], &parsed);
+            if (parsed != std::strlen(argv[first_arg + 1]) || max_new_tokens <= 0 ||
                 max_new_tokens > MAX_SEQUENCE_LENGTH)
             {
                 throw std::invalid_argument("max_new_tokens");
@@ -1391,70 +1566,38 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    // Instruct weights expect a user message followed by an assistant header.
-    std::vector<int> token_ids = tokenizer.encode_dialog_prompt({{"user", prompt}});
-    if (token_ids.size() >= MAX_SEQUENCE_LENGTH)
+    std::vector<std::string> prompts{prompt};
+    for (int arg = first_arg + 2; arg < argc; ++arg)
     {
-        std::cerr << "prompt must leave room for a response\n";
-        cudaFree(cos_table_gpu);
-        cudaFree(sin_table_gpu);
-        cudaFree(weights.model_storage);
-        return -1;
+        prompts.push_back(argv[arg]);
     }
-    const int token_budget = std::min(
-        max_new_tokens, MAX_SEQUENCE_LENGTH - static_cast<int>(token_ids.size()));
-    KVCache cache{};
-    if (initializeKvCache(cache, static_cast<int>(token_ids.size()) + token_budget) != 0)
+    std::vector<Request> requests(prompts.size());
+    int max_prompt_length = 0;
+    for (size_t index = 0; index < prompts.size(); ++index)
     {
-        cudaFree(cos_table_gpu);
-        cudaFree(sin_table_gpu);
-        cudaFree(weights.model_storage);
-        return -1;
-    }
-
-    int next_token_id = -1;
-    int generation_status = prefill(
-        token_ids,
-        weights,
-        cache,
-        cos_table_gpu,
-        sin_table_gpu,
-        next_token_id);
-
-    std::vector<int> generated_tokens;
-    for (int step = 0; generation_status == 0 && step < token_budget; ++step)
-    {
-        if (next_token_id == tokenizer.eot_id() || next_token_id == tokenizer.eos_id())
+        Request &request = requests[index];
+        // Instruct weights expect a user message followed by an assistant header.
+        request.prompt_tokens = tokenizer.encode_dialog_prompt({{"user", prompts[index]}});
+        if (request.prompt_tokens.empty() || request.prompt_tokens.size() >= MAX_SEQUENCE_LENGTH)
         {
-            break;
+            std::cerr << "prompt " << index + 1 << " must leave room for a response\n";
+            cudaFree(cos_table_gpu);
+            cudaFree(sin_table_gpu);
+            cudaFree(weights.model_storage);
+            return -1;
         }
-        generated_tokens.push_back(next_token_id);
-        if (step + 1 == token_budget)
-        {
-            break; // No need to process the final prediction.
-        }
-        const int token_to_process = next_token_id;
-        generation_status = decode(
-            token_to_process, weights, cache,
-            cos_table_gpu, sin_table_gpu, next_token_id);
-    }
-    if (generation_status == 0)
-    {
-        // Join the full byte sequence so split UTF-8 tokens decode correctly.
-        std::cout << "Response: " << tokenizer.decode(generated_tokens) << '\n';
-        std::cout << "Generated token IDs:";
-        for (int token : generated_tokens)
-        {
-            std::cout << ' ' << token;
-        }
-        std::cout << '\n';
-        if (token_budget < max_new_tokens && static_cast<int>(generated_tokens.size()) == token_budget)
-        {
-            std::cout << "Stopped at the context limit.\n";
-        }
+        const int prompt_length = static_cast<int>(request.prompt_tokens.size());
+        request.token_budget = std::min(max_new_tokens, MAX_SEQUENCE_LENGTH - prompt_length);
+        max_prompt_length = std::max(max_prompt_length, prompt_length);
     }
 
-    freeKvCache(cache);
+    InferenceBuffers buffers{};
+    buffers.token_capacity = std::max(max_prompt_length, BATCH_SIZE);
+    const int generation_status = generateRequests(
+        requests, weights, buffers, tokenizer,
+        cos_table_gpu, sin_table_gpu, continuous_batching);
+
+    freeInferenceBuffers(buffers);
     cudaFree(cos_table_gpu);
     cudaFree(sin_table_gpu);
     cudaFree(weights.model_storage);

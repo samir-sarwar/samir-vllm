@@ -60,8 +60,10 @@ cudaError_t launchSwiGlu(
     int token_count,
     int intermediate_size);
 
-// Writes the smallest vocabulary index with the maximum FP32 logit.
+// One prediction per row of [token, vocabulary] FP32 logits.
+// Ties choose the smallest vocabulary index.
 cudaError_t launchArgmax(
     const float *logits,
     int *token_id,
-    int vocabulary_size);
+    int vocabulary_size,
+    int token_count = 1);

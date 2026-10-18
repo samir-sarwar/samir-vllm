@@ -38,12 +38,15 @@ The series follows what happens between a prompt and a generated token, from loa
 - The final RMSNorm and tied embedding/LM-head projection produce FP32 logits; GPU argmax selects each next token.
 - A contiguous BF16 KV cache for every layer. Prefill fills it from the whole prompt; decode processes one new token at its absolute RoPE position and attends to the cached prefix.
 - Greedy response generation with Instruct chat formatting, end-of-turn/end-of-text stopping, and configurable output length within the 2,048-token context.
+- Persistent scratch buffers and one cuBLAS handle shared by prefill and decode. Q storage is reused for output/MLP projections, and normalization storage is reused for attention output.
+- Batched decode for up to two requests, with packed projections and a separate contiguous KV cache and attention length per sequence.
+- Static batching and a continuous scheduler that prefills queued prompts into freed slots between decode steps.
 
 Part 8 follows these changes in [Prefill, Decode, and the KV Cache](proper_notes/youtubePT8_prefill_decode_kv_cache.md).
 
 ## Next steps
 
-Batching, paged KV storage, and reusing scratch allocations across decode steps come later. This version runs one sequence at a time and prioritizes readable, explicit operations.
+Paged KV storage comes next. This version keeps two fixed sequence slots and contiguous caches, with readable, explicit operations.
 
 ## Build
 
@@ -63,22 +66,24 @@ cp models/Llama-3.2-1B-Instruct/original/tokenizer.model models/llama-3.2-1b-ins
 cmake -S . -B build
 cmake --build build -j
 ./build/samir-vllm "Explain the KV cache in two sentences." 128
+# Continuous batching (default): two active slots, three queued requests.
+./build/samir-vllm "Say hello." 64 "Explain the KV cache." "What is RoPE?"
+# Static batching: wait for both requests in a group before admitting more.
+./build/samir-vllm --static "Say hello." 64 "Explain the KV cache." "What is RoPE?"
 ./build/tokenizer-test models/llama-3.2-1b-instruct/tokenizer.model
-./build/kv-cache-test
-./build/kv-cache-test --model
 ```
 
-The second argument is `max_new_tokens` (default: 128). The prompt is formatted as an Instruct user message; the executable prints the generated response and its token IDs. Generation stops at a model stop token or the output/context limit.
+After the optional `--static` or `--continuous` flag, the first argument is a prompt and the second is `max_new_tokens` (default: 128). Any remaining arguments are additional prompts; the token budget applies to each request. Every prompt is formatted as an Instruct user message. Generation stops independently at a model stop token or the output/context limit, and each completed response is printed with its token IDs and request number.
 
-`kv-cache-test` checks GPU attention against CPU calculations without model weights. With `--model`, it also compares cached decode with dense full-prefix inference, including cache reset and bounds checks. Both modes require a CUDA GPU. An independent Hugging Face comparison is available with `python3 python/reference_generation.py "Say hello in one sentence." --max-new-tokens 32` (requires `torch`, `transformers`, and access to the matching model).
+Prompts are prefilled one at a time, pausing decode. Each decode step packs one token from every active sequence into the shared buffers. Attention reads only that sequence's cache; requests can have different prompt and output lengths. Continuous batching immediately reuses finished slots, while static batching admits the next group after the current group finishes.
 
 ## Project layout
 
 ```text
 src/           Engine entry point, CUDA kernels, and tokenizer implementation
 include/       Public kernel and tokenizer headers
-tests/         Tokenizer and GPU attention/KV-cache tests
-python/        Tokenizer and generation reference scripts
+tests/         Tokenizer tests
+python/        Tokenizer reference script
 proper_notes/  Notes for the video series
 notes.md       Working notes from the build
 ```

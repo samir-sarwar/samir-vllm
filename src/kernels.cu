@@ -436,7 +436,7 @@ __global__ void swiGluKernel(
     gate[index] = __float2bfloat16((g / (1.0f + expf(-g))) * u);
 }
 
-// One block is sufficient for a single next-token prediction. Each thread
+// One block handles each next-token prediction. Each thread
 // scans a strided portion of the vocabulary, then the block reduces the
 // candidates. Equal logits choose the lower token ID deterministically.
 __global__ void argmaxKernel(const float *logits, int *token_id, int vocabulary_size)
@@ -445,6 +445,7 @@ __global__ void argmaxKernel(const float *logits, int *token_id, int vocabulary_
     __shared__ float best_values[THREADS];
     __shared__ int best_indices[THREADS];
 
+    logits += static_cast<size_t>(blockIdx.x) * vocabulary_size;
     const int thread = threadIdx.x;
     float best_value = -CUDART_INF_F;
     int best_index = vocabulary_size;
@@ -478,7 +479,7 @@ __global__ void argmaxKernel(const float *logits, int *token_id, int vocabulary_
     }
     if (thread == 0)
     {
-        *token_id = best_indices[0];
+        token_id[blockIdx.x] = best_indices[0];
     }
 }
 
@@ -687,12 +688,16 @@ cudaError_t launchSwiGlu(
     return cudaGetLastError();
 }
 
-cudaError_t launchArgmax(const float *logits, int *token_id, int vocabulary_size)
+cudaError_t launchArgmax(
+    const float *logits,
+    int *token_id,
+    int vocabulary_size,
+    int token_count)
 {
-    if (logits == nullptr || token_id == nullptr || vocabulary_size <= 0)
+    if (logits == nullptr || token_id == nullptr || vocabulary_size <= 0 || token_count <= 0)
     {
         return cudaErrorInvalidValue;
     }
-    argmaxKernel<<<1, 256>>>(logits, token_id, vocabulary_size);
+    argmaxKernel<<<token_count, 256>>>(logits, token_id, vocabulary_size);
     return cudaGetLastError();
 }
