@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cmath>
+#include <array>
 #include <vector>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -66,6 +67,9 @@ constexpr int HEAD_DIM = 64;
 constexpr int NUM_QUERY_HEADS = HIDDEN_SIZE / HEAD_DIM;
 constexpr int NUM_KV_HEADS = KV_DIM / HEAD_DIM;
 constexpr int QUERY_HEADS_PER_KV_HEAD = NUM_QUERY_HEADS / NUM_KV_HEADS;
+constexpr int KV_PAGE_TOKENS = 16;
+constexpr int MAX_KV_PAGES_PER_LAYER =
+    (MAX_SEQUENCE_LENGTH + KV_PAGE_TOKENS - 1) / KV_PAGE_TOKENS;
 
 static_assert(HIDDEN_SIZE % HEAD_DIM == 0);
 static_assert(KV_DIM % HEAD_DIM == 0);
@@ -300,12 +304,97 @@ struct LLamaWeights
     __nv_bfloat16 *mlp_down_proj[N_LAYERS]{};
 };
 
-// One sequence, stored as [layer, position, kv_feature] in each allocation.
+// Each entry maps one layer's logical page to a physical page in the shared pool.
+// This stays on the CPU while attention still uses the existing cuBLAS path.
+struct KVBlockTable
+{
+    std::array<std::array<int, MAX_KV_PAGES_PER_LAYER>, N_LAYERS> layers;
+
+    KVBlockTable()
+    {
+        for (auto &layer : layers)
+        {
+            layer.fill(-1);
+        }
+    }
+};
+
+struct KVPageAllocator
+{
+    std::vector<int> free_pages;
+
+    explicit KVPageAllocator(int page_count) : free_pages(page_count)
+    {
+        std::iota(free_pages.begin(), free_pages.end(), 0);
+    }
+
+    // Reserve enough pages for this prefix in every layer. Check the entire
+    // request first so exhaustion cannot leave a partially updated block table.
+    bool reserve(KVBlockTable &table, int token_count)
+    {
+        if (token_count <= 0 || token_count > MAX_SEQUENCE_LENGTH)
+        {
+            return false;
+        }
+        const int page_count = (token_count + KV_PAGE_TOKENS - 1) / KV_PAGE_TOKENS;
+        size_t needed = 0;
+        for (const auto &layer : table.layers)
+        {
+            for (int page = 0; page < page_count; ++page)
+            {
+                needed += layer[page] == -1;
+            }
+        }
+        if (needed > free_pages.size())
+        {
+            return false;
+        }
+        for (auto &layer : table.layers)
+        {
+            for (int page = 0; page < page_count; ++page)
+            {
+                if (layer[page] == -1)
+                {
+                    layer[page] = free_pages.back();
+                    free_pages.pop_back();
+                }
+            }
+        }
+        return true;
+    }
+
+    void release(KVBlockTable &table)
+    {
+        for (auto &layer : table.layers)
+        {
+            for (int &page : layer)
+            {
+                if (page != -1)
+                {
+                    free_pages.push_back(page);
+                    page = -1;
+                }
+            }
+        }
+    }
+};
+
+// A physical page holds [16 tokens of K, 16 tokens of V] for one layer.
+// Keep the same total KV memory budget as the old two contiguous caches.
+constexpr size_t KV_PAGE_VALUES = static_cast<size_t>(KV_PAGE_TOKENS) * KV_DIM;
+constexpr int KV_PAGE_COUNT = BATCH_SIZE * N_LAYERS * MAX_KV_PAGES_PER_LAYER;
+struct KVCachePool
+{
+    __nv_bfloat16 *data = nullptr;
+    KVPageAllocator allocator{KV_PAGE_COUNT};
+};
+
+// One sequence owns a block table, but borrows physical pages from the pool.
 // Keys are already rotated by RoPE; values are unrotated.
 struct KVCache
 {
-    __nv_bfloat16 *keys = nullptr;
-    __nv_bfloat16 *values = nullptr;
+    KVCachePool *pool = nullptr;
+    KVBlockTable block_table;
     int capacity = 0;
     int length = 0; // Number of tokens actually processed, not predicted.
 };
@@ -633,31 +722,102 @@ std::vector<int> tokenize(Tokenizer &tokenizer, const std::string &prompt)
 
 void freeKvCache(KVCache &cache)
 {
-    cudaFree(cache.keys);
-    cudaFree(cache.values);
-    cache = KVCache{};
+    if (cache.pool != nullptr)
+    {
+        cache.pool->allocator.release(cache.block_table);
+    }
+    cache.length = 0;
 }
 
-int initializeKvCache(KVCache &cache, int capacity)
+int initializeKvCache(KVCache &cache, KVCachePool &pool)
 {
-    if (capacity <= 0 || capacity > MAX_SEQUENCE_LENGTH ||
-        cache.keys != nullptr || cache.values != nullptr)
+    if (pool.data == nullptr || cache.pool != nullptr)
     {
-        std::cerr << "invalid KV cache capacity or cache already allocated\n";
+        std::cerr << "invalid KV pool or cache already initialized\n";
         return -1;
     }
+    cache.pool = &pool;
+    cache.capacity = MAX_SEQUENCE_LENGTH;
+    return 0;
+}
 
-    const size_t bytes = static_cast<size_t>(N_LAYERS) * capacity *
-                         KV_DIM * sizeof(__nv_bfloat16);
-    if (cudaMalloc(&cache.keys, bytes) != cudaSuccess ||
-        cudaMalloc(&cache.values, bytes) != cudaSuccess)
+// Append this layer's new rows at cache.length. A copy can start in a partly
+// filled page and cross any number of page boundaries (including prefill).
+// The caller reserves pages for all layers before writing any of them.
+int appendKvCache(KVCache &cache, int layer,
+                  const __nv_bfloat16 *keys, const __nv_bfloat16 *values,
+                  int token_count)
+{
+    if (cache.pool == nullptr || cache.pool->data == nullptr ||
+        layer < 0 || layer >= N_LAYERS || keys == nullptr || values == nullptr ||
+        token_count <= 0 || cache.length < 0 ||
+        token_count > cache.capacity - cache.length)
     {
-        std::cerr << "KV cache allocation failed\n";
-        freeKvCache(cache);
+        std::cerr << "invalid KV append\n";
         return -1;
     }
-    cache.capacity = capacity;
-    cache.length = 0;
+    for (int copied = 0; copied < token_count;)
+    {
+        const int position = cache.length + copied;
+        const int offset = position % KV_PAGE_TOKENS;
+        const int page = cache.block_table.layers[layer][position / KV_PAGE_TOKENS];
+        if (page < 0 || page >= KV_PAGE_COUNT)
+        {
+            std::cerr << "KV append requires an allocated page\n";
+            return -1;
+        }
+        const int count = std::min(token_count - copied, KV_PAGE_TOKENS - offset);
+        __nv_bfloat16 *page_keys = cache.pool->data +
+                                   static_cast<size_t>(page) * 2 * KV_PAGE_VALUES + offset * KV_DIM;
+        __nv_bfloat16 *page_values = page_keys + KV_PAGE_VALUES;
+        const size_t bytes = static_cast<size_t>(count) * KV_DIM * sizeof(__nv_bfloat16);
+        if (cudaMemcpy(page_keys, keys + static_cast<size_t>(copied) * KV_DIM,
+                       bytes, cudaMemcpyDeviceToDevice) != cudaSuccess ||
+            cudaMemcpy(page_values, values + static_cast<size_t>(copied) * KV_DIM,
+                       bytes, cudaMemcpyDeviceToDevice) != cudaSuccess)
+        {
+            std::cerr << "KV page append failed\n";
+            return -1;
+        }
+        copied += count;
+    }
+    return 0;
+}
+
+// Bridge paged storage to the existing dense attention operations. These are
+// shared scratch rows, not a second persistent cache for each sequence/layer.
+int gatherKvCache(const KVCache &cache, int layer, int token_count,
+                  __nv_bfloat16 *keys, __nv_bfloat16 *values)
+{
+    if (cache.pool == nullptr || cache.pool->data == nullptr ||
+        layer < 0 || layer >= N_LAYERS || keys == nullptr || values == nullptr ||
+        token_count <= 0 || token_count > cache.capacity)
+    {
+        std::cerr << "invalid KV gather\n";
+        return -1;
+    }
+    for (int position = 0; position < token_count; position += KV_PAGE_TOKENS)
+    {
+        const int page = cache.block_table.layers[layer][position / KV_PAGE_TOKENS];
+        if (page < 0 || page >= KV_PAGE_COUNT)
+        {
+            std::cerr << "KV gather requires an allocated page\n";
+            return -1;
+        }
+        const __nv_bfloat16 *page_keys = cache.pool->data +
+                                         static_cast<size_t>(page) * 2 * KV_PAGE_VALUES;
+        const __nv_bfloat16 *page_values = page_keys + KV_PAGE_VALUES;
+        const int count = std::min(token_count - position, KV_PAGE_TOKENS);
+        const size_t bytes = static_cast<size_t>(count) * KV_DIM * sizeof(__nv_bfloat16);
+        if (cudaMemcpy(keys + static_cast<size_t>(position) * KV_DIM, page_keys,
+                       bytes, cudaMemcpyDeviceToDevice) != cudaSuccess ||
+            cudaMemcpy(values + static_cast<size_t>(position) * KV_DIM, page_values,
+                       bytes, cudaMemcpyDeviceToDevice) != cudaSuccess)
+        {
+            std::cerr << "KV page gather failed\n";
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -692,15 +852,15 @@ int prefill(
     int &next_token_id,
     std::vector<float> *logits_cpu = nullptr)
 {
-    cache.length = 0; // A new prompt replaces the previous sequence.
     if (token_ids.empty() ||
         token_ids.size() > MAX_SEQUENCE_LENGTH ||
         token_ids.size() > static_cast<size_t>(buffers.token_capacity) ||
-        cache.keys == nullptr || cache.values == nullptr ||
+        cache.pool == nullptr || cache.pool->data == nullptr ||
         cache.capacity <= 0 || cache.capacity > MAX_SEQUENCE_LENGTH ||
         token_ids.size() > static_cast<size_t>(cache.capacity) ||
         std::any_of(token_ids.begin(), token_ids.end(),
-                    [](int id) { return id < 0 || id >= VOCAB_SIZE; }) ||
+                    [](int id)
+                    { return id < 0 || id >= VOCAB_SIZE; }) ||
         cos_table_gpu == nullptr ||
         sin_table_gpu == nullptr)
     {
@@ -709,6 +869,12 @@ int prefill(
     }
 
     const int token_count = static_cast<int>(token_ids.size());
+    freeKvCache(cache); // A new prompt releases the previous sequence's pages.
+    if (!cache.pool->allocator.reserve(cache.block_table, token_count))
+    {
+        std::cerr << "not enough free KV pages for prefill\n";
+        return -1;
+    }
     int *&token_id_gpu = buffers.token_ids_gpu;
     int *&position_ids_gpu = buffers.position_ids_gpu;
     __nv_bfloat16 *&activations_gpu = buffers.activations_gpu;
@@ -727,6 +893,7 @@ int prefill(
 
     auto free_prefill_buffers = [&]()
     {
+        freeKvCache(cache);
         freeInferenceBuffers(buffers);
     };
 
@@ -735,6 +902,7 @@ int prefill(
         cudaMalloc(&token_id_gpu, buffers.token_capacity * sizeof(int)) != 0)
     {
         std::cerr << "gpu token mem allocation failed";
+        free_prefill_buffers();
         return -1;
     }
     if (cudaMemcpy(token_id_gpu, token_ids.data(), token_ids.size() * sizeof(int), cudaMemcpyHostToDevice) != 0)
@@ -814,293 +982,285 @@ int prefill(
     // Each layer starts with its own input norm and finishes with its MLP residual.
     for (int layer = 0; layer < N_LAYERS; ++layer)
     {
-    if (launchRmsNorm(
-            activations_gpu,
+        if (launchRmsNorm(
+                activations_gpu,
+                normalized_gpu,
+                weights.input_layernorm[layer],
+                token_count) != cudaSuccess)
+        {
+            std::cerr << "RMSNorm kernel launch failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        cudaError_t execution_error = cudaDeviceSynchronize();
+
+        if (execution_error != cudaSuccess)
+        {
+            std::cerr << "RMSNorm execution failed: "
+                      << cudaGetErrorString(execution_error)
+                      << '\n';
+            free_prefill_buffers();
+            return -1;
+        }
+
+        const size_t q_bytes =
+            static_cast<size_t>(buffers.token_capacity) *
+            HIDDEN_SIZE *
+            sizeof(__nv_bfloat16);
+
+        // Decode gathers a full cached prefix into these same K/V scratch buffers.
+        const size_t kv_buffer_bytes =
+            static_cast<size_t>(MAX_SEQUENCE_LENGTH) * KV_DIM * sizeof(__nv_bfloat16);
+
+        // Create Q/K/V buffers and the cuBLAS handle once, then reuse them.
+        if (layer == 0 &&
+            ((q_gpu == nullptr && cudaMalloc(&q_gpu, q_bytes) != cudaSuccess) ||
+             (k_gpu == nullptr && cudaMalloc(&k_gpu, kv_buffer_bytes) != cudaSuccess) ||
+             (v_gpu == nullptr && cudaMalloc(&v_gpu, kv_buffer_bytes) != cudaSuccess)))
+        {
+            std::cerr << "Q/K/V buffer allocation failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        if (layer == 0 && cublas_handle == nullptr && cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
+        {
+            std::cerr << "cuBLAS initialization failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        const cublasStatus_t q_status = projectBf16RowMajor(
+            cublas_handle,
             normalized_gpu,
-            weights.input_layernorm[layer],
-            token_count) != cudaSuccess)
-    {
-        std::cerr << "RMSNorm kernel launch failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    cudaError_t execution_error = cudaDeviceSynchronize();
-
-    if (execution_error != cudaSuccess)
-    {
-        std::cerr << "RMSNorm execution failed: "
-                  << cudaGetErrorString(execution_error)
-                  << '\n';
-        free_prefill_buffers();
-        return -1;
-    }
-
-    const size_t q_bytes =
-        static_cast<size_t>(buffers.token_capacity) *
-        HIDDEN_SIZE *
-        sizeof(__nv_bfloat16);
-
-    const size_t kv_bytes =
-        static_cast<size_t>(token_count) *
-        KV_DIM *
-        sizeof(__nv_bfloat16);
-
-    const size_t kv_buffer_bytes =
-        static_cast<size_t>(buffers.token_capacity) * KV_DIM * sizeof(__nv_bfloat16);
-
-    // Create Q/K/V buffers and the cuBLAS handle once, then reuse them.
-    if (layer == 0 &&
-        ((q_gpu == nullptr && cudaMalloc(&q_gpu, q_bytes) != cudaSuccess) ||
-         (k_gpu == nullptr && cudaMalloc(&k_gpu, kv_buffer_bytes) != cudaSuccess) ||
-         (v_gpu == nullptr && cudaMalloc(&v_gpu, kv_buffer_bytes) != cudaSuccess)))
-    {
-        std::cerr << "Q/K/V buffer allocation failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    if (layer == 0 && cublas_handle == nullptr && cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
-    {
-        std::cerr << "cuBLAS initialization failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    const cublasStatus_t q_status = projectBf16RowMajor(
-        cublas_handle,
-        normalized_gpu,
-        weights.w_q[layer],
-        q_gpu,
-        token_count,
-        HIDDEN_SIZE,
-        HIDDEN_SIZE);
-
-    const cublasStatus_t k_status = projectBf16RowMajor(
-        cublas_handle,
-        normalized_gpu,
-        weights.w_k[layer],
-        k_gpu,
-        token_count,
-        HIDDEN_SIZE,
-        KV_DIM);
-
-    const cublasStatus_t v_status = projectBf16RowMajor(
-        cublas_handle,
-        normalized_gpu,
-        weights.w_v[layer],
-        v_gpu,
-        token_count,
-        HIDDEN_SIZE,
-        KV_DIM);
-
-    if (q_status != CUBLAS_STATUS_SUCCESS ||
-        k_status != CUBLAS_STATUS_SUCCESS ||
-        v_status != CUBLAS_STATUS_SUCCESS)
-    {
-        std::cerr << "Q/K/V projection failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    // Position belongs in the Q–K comparison, so rotate Q and K only.
-    if (launchRope(
-            q_gpu, position_ids_gpu, cos_table_gpu, sin_table_gpu,
-            token_count, HIDDEN_SIZE, HEAD_DIM) != cudaSuccess ||
-        launchRope(
-            k_gpu, position_ids_gpu, cos_table_gpu, sin_table_gpu,
-            token_count, KV_DIM, HEAD_DIM) != cudaSuccess)
-    {
-        std::cerr << "RoPE application to Q/K failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    if (cudaDeviceSynchronize() != cudaSuccess)
-    {
-        std::cerr << "Q/K/V projection or RoPE execution failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    // Keep this layer's prompt K/V for the later decode steps. Keys have
-    // already passed through RoPE; values are stored without rotation.
-    const size_t layer_offset = static_cast<size_t>(layer) * cache.capacity * KV_DIM;
-    if (cudaMemcpy(cache.keys + layer_offset, k_gpu, kv_bytes,
-                   cudaMemcpyDeviceToDevice) != cudaSuccess ||
-        cudaMemcpy(cache.values + layer_offset, v_gpu, kv_bytes,
-                   cudaMemcpyDeviceToDevice) != cudaSuccess)
-    {
-        std::cerr << "prefill KV cache copy failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    // GQA keeps 32 query heads but shares 8 key/value heads. Scores are
-    // [query_head, query_token, key_token], so each Q head has one T x T
-    // matrix and maps to KV head query_head / 4.
-    const size_t attention_score_bytes =
-        static_cast<size_t>(NUM_QUERY_HEADS) *
-        std::max(static_cast<size_t>(buffers.token_capacity) * buffers.token_capacity,
-                 static_cast<size_t>(MAX_SEQUENCE_LENGTH)) *
-        sizeof(__nv_bfloat16);
-
-    // Q/K/V have consumed the norm; Q is consumed before the output projection.
-    attention_output_gpu = normalized_gpu;
-    output_projection_gpu = q_gpu;
-
-    // Attention scratch has the same shape in every layer and covers long decode.
-    if (layer == 0 && attention_scores_gpu == nullptr &&
-        cudaMalloc(&attention_scores_gpu, attention_score_bytes) != cudaSuccess)
-    {
-        std::cerr << "attention buffer allocation failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    if (computeGqaAttentionScores(
-            cublas_handle,
+            weights.w_q[layer],
             q_gpu,
-            k_gpu,
-            attention_scores_gpu,
-            token_count) != CUBLAS_STATUS_SUCCESS)
-    {
-        std::cerr << "GQA score projection failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    // Prevent future tokens from influencing the current token, then turn
-    // every score row into a stable probability distribution.
-    if (launchCausalMask(
-            attention_scores_gpu,
-            token_count,
-            NUM_QUERY_HEADS) != cudaSuccess ||
-        launchStableSoftmax(
-            attention_scores_gpu,
-            token_count,
-            NUM_QUERY_HEADS) != cudaSuccess)
-    {
-        std::cerr << "causal mask or stable softmax launch failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    if (mixGqaValues(
-            cublas_handle,
-            attention_scores_gpu,
-            v_gpu,
-            attention_output_gpu,
-            token_count) != CUBLAS_STATUS_SUCCESS)
-    {
-        std::cerr << "GQA value mixing failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    if (projectBf16RowMajor(
-            cublas_handle,
-            attention_output_gpu,
-            weights.w_o[layer],
-            output_projection_gpu,
             token_count,
             HIDDEN_SIZE,
-            HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS)
-    {
-        std::cerr << "attention output projection failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
+            HIDDEN_SIZE);
 
-    if (launchResidualAdd(
-            activations_gpu,
-            output_projection_gpu,
-            token_count,
-            HIDDEN_SIZE) != cudaSuccess)
-    {
-        std::cerr << "attention residual launch failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    execution_error = cudaDeviceSynchronize();
-    if (execution_error != cudaSuccess)
-    {
-        std::cerr << "attention execution failed: "
-                  << cudaGetErrorString(execution_error)
-                  << '\n';
-        free_prefill_buffers();
-        return -1;
-    }
-
-    // The second norm feeds two parallel 8192-wide projections.
-    if (launchRmsNorm(
-            activations_gpu,
-            normalized_gpu,
-            weights.post_attn_layernorms[layer],
-            token_count) != cudaSuccess)
-    {
-        std::cerr << "post-attention RMSNorm launch failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    const cublasStatus_t gate_status = projectBf16RowMajor(
-        cublas_handle,
-        normalized_gpu,
-        weights.mlp_gate_proj[layer],
-        gate_gpu,
-        token_count,
-        HIDDEN_SIZE,
-        INTERMEDIATE_SIZE);
-
-    const cublasStatus_t up_status = projectBf16RowMajor(
-        cublas_handle,
-        normalized_gpu,
-        weights.mlp_up_proj[layer],
-        up_gpu,
-        token_count,
-        HIDDEN_SIZE,
-        INTERMEDIATE_SIZE);
-
-    if (gate_status != CUBLAS_STATUS_SUCCESS ||
-        up_status != CUBLAS_STATUS_SUCCESS)
-    {
-        std::cerr << "MLP gate/up projection failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
-
-    // SwiGLU overwrites gate with SiLU(gate) * up. The attention projection
-    // buffer is free to reuse for the 2048-wide MLP down projection.
-    if (launchSwiGlu(gate_gpu, up_gpu, token_count, INTERMEDIATE_SIZE) != cudaSuccess ||
-        projectBf16RowMajor(
+        const cublasStatus_t k_status = projectBf16RowMajor(
             cublas_handle,
-            gate_gpu,
-            weights.mlp_down_proj[layer],
-            output_projection_gpu,
+            normalized_gpu,
+            weights.w_k[layer],
+            k_gpu,
             token_count,
-            INTERMEDIATE_SIZE,
-            HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
-        launchResidualAdd(
-            activations_gpu,
-            output_projection_gpu,
-            token_count,
-            HIDDEN_SIZE) != cudaSuccess)
-    {
-        std::cerr << "MLP or residual launch failed\n";
-        free_prefill_buffers();
-        return -1;
-    }
+            HIDDEN_SIZE,
+            KV_DIM);
 
-    execution_error = cudaDeviceSynchronize();
-    if (execution_error != cudaSuccess)
-    {
-        std::cerr << "MLP execution failed in layer " << layer << ": "
-                  << cudaGetErrorString(execution_error) << '\n';
-        free_prefill_buffers();
-        return -1;
-    }
+        const cublasStatus_t v_status = projectBf16RowMajor(
+            cublas_handle,
+            normalized_gpu,
+            weights.w_v[layer],
+            v_gpu,
+            token_count,
+            HIDDEN_SIZE,
+            KV_DIM);
+
+        if (q_status != CUBLAS_STATUS_SUCCESS ||
+            k_status != CUBLAS_STATUS_SUCCESS ||
+            v_status != CUBLAS_STATUS_SUCCESS)
+        {
+            std::cerr << "Q/K/V projection failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        // Position belongs in the Q–K comparison, so rotate Q and K only.
+        if (launchRope(
+                q_gpu, position_ids_gpu, cos_table_gpu, sin_table_gpu,
+                token_count, HIDDEN_SIZE, HEAD_DIM) != cudaSuccess ||
+            launchRope(
+                k_gpu, position_ids_gpu, cos_table_gpu, sin_table_gpu,
+                token_count, KV_DIM, HEAD_DIM) != cudaSuccess)
+        {
+            std::cerr << "RoPE application to Q/K failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        if (cudaDeviceSynchronize() != cudaSuccess)
+        {
+            std::cerr << "Q/K/V projection or RoPE execution failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        // Keep this layer's prompt K/V for the later decode steps. Keys have
+        // already passed through RoPE; values are stored without rotation.
+        if (appendKvCache(cache, layer, k_gpu, v_gpu, token_count) != 0)
+        {
+            std::cerr << "prefill KV cache copy failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        // GQA keeps 32 query heads but shares 8 key/value heads. Scores are
+        // [query_head, query_token, key_token], so each Q head has one T x T
+        // matrix and maps to KV head query_head / 4.
+        const size_t attention_score_bytes =
+            static_cast<size_t>(NUM_QUERY_HEADS) *
+            std::max(static_cast<size_t>(buffers.token_capacity) * buffers.token_capacity,
+                     static_cast<size_t>(MAX_SEQUENCE_LENGTH)) *
+            sizeof(__nv_bfloat16);
+
+        // Q/K/V have consumed the norm; Q is consumed before the output projection.
+        attention_output_gpu = normalized_gpu;
+        output_projection_gpu = q_gpu;
+
+        // Attention scratch has the same shape in every layer and covers long decode.
+        if (layer == 0 && attention_scores_gpu == nullptr &&
+            cudaMalloc(&attention_scores_gpu, attention_score_bytes) != cudaSuccess)
+        {
+            std::cerr << "attention buffer allocation failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        if (computeGqaAttentionScores(
+                cublas_handle,
+                q_gpu,
+                k_gpu,
+                attention_scores_gpu,
+                token_count) != CUBLAS_STATUS_SUCCESS)
+        {
+            std::cerr << "GQA score projection failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        // Prevent future tokens from influencing the current token, then turn
+        // every score row into a stable probability distribution.
+        if (launchCausalMask(
+                attention_scores_gpu,
+                token_count,
+                NUM_QUERY_HEADS) != cudaSuccess ||
+            launchStableSoftmax(
+                attention_scores_gpu,
+                token_count,
+                NUM_QUERY_HEADS) != cudaSuccess)
+        {
+            std::cerr << "causal mask or stable softmax launch failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        if (mixGqaValues(
+                cublas_handle,
+                attention_scores_gpu,
+                v_gpu,
+                attention_output_gpu,
+                token_count) != CUBLAS_STATUS_SUCCESS)
+        {
+            std::cerr << "GQA value mixing failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        if (projectBf16RowMajor(
+                cublas_handle,
+                attention_output_gpu,
+                weights.w_o[layer],
+                output_projection_gpu,
+                token_count,
+                HIDDEN_SIZE,
+                HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS)
+        {
+            std::cerr << "attention output projection failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        if (launchResidualAdd(
+                activations_gpu,
+                output_projection_gpu,
+                token_count,
+                HIDDEN_SIZE) != cudaSuccess)
+        {
+            std::cerr << "attention residual launch failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        execution_error = cudaDeviceSynchronize();
+        if (execution_error != cudaSuccess)
+        {
+            std::cerr << "attention execution failed: "
+                      << cudaGetErrorString(execution_error)
+                      << '\n';
+            free_prefill_buffers();
+            return -1;
+        }
+
+        // The second norm feeds two parallel 8192-wide projections.
+        if (launchRmsNorm(
+                activations_gpu,
+                normalized_gpu,
+                weights.post_attn_layernorms[layer],
+                token_count) != cudaSuccess)
+        {
+            std::cerr << "post-attention RMSNorm launch failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        const cublasStatus_t gate_status = projectBf16RowMajor(
+            cublas_handle,
+            normalized_gpu,
+            weights.mlp_gate_proj[layer],
+            gate_gpu,
+            token_count,
+            HIDDEN_SIZE,
+            INTERMEDIATE_SIZE);
+
+        const cublasStatus_t up_status = projectBf16RowMajor(
+            cublas_handle,
+            normalized_gpu,
+            weights.mlp_up_proj[layer],
+            up_gpu,
+            token_count,
+            HIDDEN_SIZE,
+            INTERMEDIATE_SIZE);
+
+        if (gate_status != CUBLAS_STATUS_SUCCESS ||
+            up_status != CUBLAS_STATUS_SUCCESS)
+        {
+            std::cerr << "MLP gate/up projection failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        // SwiGLU overwrites gate with SiLU(gate) * up. The attention projection
+        // buffer is free to reuse for the 2048-wide MLP down projection.
+        if (launchSwiGlu(gate_gpu, up_gpu, token_count, INTERMEDIATE_SIZE) != cudaSuccess ||
+            projectBf16RowMajor(
+                cublas_handle,
+                gate_gpu,
+                weights.mlp_down_proj[layer],
+                output_projection_gpu,
+                token_count,
+                INTERMEDIATE_SIZE,
+                HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
+            launchResidualAdd(
+                activations_gpu,
+                output_projection_gpu,
+                token_count,
+                HIDDEN_SIZE) != cudaSuccess)
+        {
+            std::cerr << "MLP or residual launch failed\n";
+            free_prefill_buffers();
+            return -1;
+        }
+
+        execution_error = cudaDeviceSynchronize();
+        if (execution_error != cudaSuccess)
+        {
+            std::cerr << "MLP execution failed in layer " << layer << ": "
+                      << cudaGetErrorString(execution_error) << '\n';
+            free_prefill_buffers();
+            return -1;
+        }
     } // next layer uses this layer's residual output as its hidden state
 
     // Only the last prompt position contributes the next-token logits.
@@ -1182,7 +1342,7 @@ int decode(
     for (int row = 0; row < token_count; ++row)
     {
         const KVCache *cache = caches[row];
-        if (cache == nullptr || cache->keys == nullptr || cache->values == nullptr ||
+        if (cache == nullptr || cache->pool == nullptr || cache->pool->data == nullptr ||
             cache->capacity <= 0 || cache->capacity > MAX_SEQUENCE_LENGTH ||
             cache->length <= 0 || cache->length >= cache->capacity ||
             token_ids[row] < 0 || token_ids[row] >= VOCAB_SIZE)
@@ -1191,6 +1351,14 @@ int decode(
             return -1;
         }
         position_ids_cpu[row] = cache->length;
+    }
+    for (KVCache *cache : caches)
+    {
+        if (!cache->pool->allocator.reserve(cache->block_table, cache->length + 1))
+        {
+            std::cerr << "not enough free KV pages for decode\n";
+            return -1;
+        }
     }
 
     int *token_id_gpu = buffers.token_ids_gpu;
@@ -1226,11 +1394,11 @@ int decode(
         if (launchRmsNorm(activations_gpu, normalized_gpu,
                           weights.input_layernorm[layer], token_count) != cudaSuccess ||
             projectBf16RowMajor(cublas_handle, normalized_gpu, weights.w_q[layer],
-                               q_gpu, token_count, HIDDEN_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
+                                q_gpu, token_count, HIDDEN_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
             projectBf16RowMajor(cublas_handle, normalized_gpu, weights.w_k[layer],
-                               k_gpu, token_count, HIDDEN_SIZE, KV_DIM) != CUBLAS_STATUS_SUCCESS ||
+                                k_gpu, token_count, HIDDEN_SIZE, KV_DIM) != CUBLAS_STATUS_SUCCESS ||
             projectBf16RowMajor(cublas_handle, normalized_gpu, weights.w_v[layer],
-                               v_gpu, token_count, HIDDEN_SIZE, KV_DIM) != CUBLAS_STATUS_SUCCESS)
+                                v_gpu, token_count, HIDDEN_SIZE, KV_DIM) != CUBLAS_STATUS_SUCCESS)
         {
             std::cerr << "decode RMSNorm or Q/K/V projection failed\n";
             return -1;
@@ -1248,31 +1416,26 @@ int decode(
 
         for (int row = 0; row < token_count; ++row)
         {
-            KVCache &cache = *caches[row];
-            const int position = cache.length;
-            const int key_count = position + 1;
-            const size_t layer_offset = static_cast<size_t>(layer) * cache.capacity * KV_DIM;
-            __nv_bfloat16 *layer_keys = cache.keys + layer_offset;
-            __nv_bfloat16 *layer_values = cache.values + layer_offset;
-            __nv_bfloat16 *new_key = layer_keys + static_cast<size_t>(position) * KV_DIM;
-            __nv_bfloat16 *new_value = layer_values + static_cast<size_t>(position) * KV_DIM;
-
-            if (cudaMemcpy(new_key, k_gpu + row * KV_DIM, KV_DIM * sizeof(__nv_bfloat16),
-                           cudaMemcpyDeviceToDevice) != cudaSuccess ||
-                cudaMemcpy(new_value, v_gpu + row * KV_DIM, KV_DIM * sizeof(__nv_bfloat16),
-                           cudaMemcpyDeviceToDevice) != cudaSuccess)
+            if (appendKvCache(*caches[row], layer, k_gpu + row * KV_DIM,
+                              v_gpu + row * KV_DIM, 1) != 0)
             {
-                std::cerr << "decode KV cache copy failed\n";
                 return -1;
             }
+        }
 
+        // Save every packed new row before gathering overwrites K/V scratch.
+        for (int row = 0; row < token_count; ++row)
+        {
+            const KVCache &cache = *caches[row];
+            const int key_count = cache.length + 1;
             // Each query attends only to its sequence's processed positions.
             // There are no future positions, so decode needs no mask.
-            if (computeGqaAttentionScores(cublas_handle, q_gpu + row * HIDDEN_SIZE, layer_keys,
+            if (gatherKvCache(cache, layer, key_count, k_gpu, v_gpu) != 0 ||
+                computeGqaAttentionScores(cublas_handle, q_gpu + row * HIDDEN_SIZE, k_gpu,
                                           attention_scores_gpu, 1, key_count) != CUBLAS_STATUS_SUCCESS ||
                 launchStableSoftmax(attention_scores_gpu, 1, NUM_QUERY_HEADS,
                                     key_count) != cudaSuccess ||
-                mixGqaValues(cublas_handle, attention_scores_gpu, layer_values,
+                mixGqaValues(cublas_handle, attention_scores_gpu, v_gpu,
                              attention_output_gpu + row * HIDDEN_SIZE, 1, key_count) != CUBLAS_STATUS_SUCCESS)
             {
                 std::cerr << "decode attention failed\n";
@@ -1281,7 +1444,7 @@ int decode(
         }
 
         if (projectBf16RowMajor(cublas_handle, attention_output_gpu, weights.w_o[layer],
-                               output_projection_gpu, token_count, HIDDEN_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
+                                output_projection_gpu, token_count, HIDDEN_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
             launchResidualAdd(activations_gpu, output_projection_gpu, token_count, HIDDEN_SIZE) != cudaSuccess ||
             launchRmsNorm(activations_gpu, normalized_gpu,
                           weights.post_attn_layernorms[layer], token_count) != cudaSuccess)
@@ -1299,7 +1462,7 @@ int decode(
         if (gate_status != CUBLAS_STATUS_SUCCESS || up_status != CUBLAS_STATUS_SUCCESS ||
             launchSwiGlu(gate_gpu, up_gpu, token_count, INTERMEDIATE_SIZE) != cudaSuccess ||
             projectBf16RowMajor(cublas_handle, gate_gpu, weights.mlp_down_proj[layer],
-                               output_projection_gpu, token_count, INTERMEDIATE_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
+                                output_projection_gpu, token_count, INTERMEDIATE_SIZE, HIDDEN_SIZE) != CUBLAS_STATUS_SUCCESS ||
             launchResidualAdd(activations_gpu, output_projection_gpu, token_count, HIDDEN_SIZE) != cudaSuccess)
         {
             std::cerr << "decode MLP or residual failed\n";
@@ -1357,6 +1520,13 @@ int generateRequests(
     const float *sin_table_gpu,
     bool continuous_batching)
 {
+    KVCachePool pool;
+    if (cudaMalloc(&pool.data, static_cast<size_t>(KV_PAGE_COUNT) *
+                                   2 * KV_PAGE_VALUES * sizeof(__nv_bfloat16)) != cudaSuccess)
+    {
+        std::cerr << "KV page pool allocation failed\n";
+        return -1;
+    }
     KVCache caches[BATCH_SIZE]{};
     int slot_requests[BATCH_SIZE];
     std::fill_n(slot_requests, BATCH_SIZE, -1);
@@ -1371,10 +1541,12 @@ int generateRequests(
         {
             freeKvCache(cache);
         }
+        cudaFree(pool.data);
+        pool.data = nullptr;
     };
     for (int slot = 0; slot < BATCH_SIZE && slot < static_cast<int>(requests.size()); ++slot)
     {
-        if (initializeKvCache(caches[slot], MAX_SEQUENCE_LENGTH) != 0)
+        if (initializeKvCache(caches[slot], pool) != 0)
         {
             free_caches();
             return -1;
@@ -1414,7 +1586,7 @@ int generateRequests(
             std::cout << "Stopped at the context limit.\n";
         }
         slot_requests[slot] = -1;
-        caches[slot].length = 0; // Old bytes are ignored and overwritten on reuse.
+        freeKvCache(caches[slot]); // Return every layer's pages before reusing the slot.
     };
 
     std::vector<int> active_slots, active_tokens, next_tokens;
