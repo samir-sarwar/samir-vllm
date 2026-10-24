@@ -39,17 +39,18 @@ The series follows what happens between a prompt and a generated token, from loa
 - A CUDA RMSNorm kernel for the 2,048-wide hidden state: it reduces in FP32 and applies the learned BF16 weights throughout the forward pass.
 - Dense causal prefill now runs all 16 layers: Q/K/V projection, RoPE, grouped-query attention, output projection, the attention residual, post-attention RMSNorm, SwiGLU MLP, and the MLP residual.
 - The final RMSNorm and tied embedding/LM-head projection produce FP32 logits; GPU argmax selects each next token.
-- A contiguous BF16 KV cache for every layer. Prefill fills it from the whole prompt; decode processes one new token at its absolute RoPE position and attends to the cached prefix.
+- A shared BF16 KV page pool with a block table per sequence and layer. Each physical page holds 16 tokens of K and V; prefill fills prompt pages and decode appends one new token at its absolute RoPE position.
 - Greedy response generation with Instruct chat formatting, end-of-turn/end-of-text stopping, and configurable output length within the 2,048-token context.
 - Persistent scratch buffers and one cuBLAS handle shared by prefill and decode. Q storage is reused for output/MLP projections, and normalization storage is reused for attention output.
-- Batched decode for up to two requests, with packed projections and a separate contiguous KV cache and attention length per sequence.
+- Batched decode for up to two requests, with packed projections and separate KV page mappings and attention lengths per sequence.
 - Static batching and a continuous scheduler that prefills queued prompts into freed slots between decode steps.
+- Direct paged decode attention with FP32 online softmax. Each query head streams its sequence's cached pages and accumulates weighted values without gathering a contiguous prefix or storing attention scores.
 
 Part 8 follows these changes in [Prefill, Decode, and the KV Cache](proper_notes/youtubePT8_prefill_decode_kv_cache.md).
 
-## Next steps
+## Current scope
 
-Paged KV storage comes next. This version keeps two fixed sequence slots and contiguous caches, with readable, explicit operations.
+The Llama 3.2 1B inference path includes dense causal prefill, paged decode attention, and static or continuous batching. Dimensions, two active slots, the 2,048-token context, and the 128 MiB KV pool remain fixed for this learning engine. Finished requests return their pages to the shared pool before a slot is reused.
 
 ## Build
 
@@ -76,7 +77,7 @@ cmake --build build -j
 ./build/tokenizer-test models/llama-3.2-1b-instruct/tokenizer.model
 ```
 
-After the optional `--static` or `--continuous` flag, the first argument is a prompt and the second is `max_new_tokens` (default: 128). Any remaining arguments are additional prompts; the token budget applies to each request. Every prompt is formatted as an Instruct user message. Generation stops independently at a model stop token or the output/context limit, and each completed response is printed with its token IDs and request number.
+After the optional `--static` or `--continuous` flag, the first argument is a prompt and the second is `max_new_tokens` (default: 128). Any remaining arguments are additional prompts; the token budget applies to each request. Every prompt is formatted as an Instruct user message. Generation stops independently at EOS, EOT, or EOM, or the output/context limit, and each completed response is printed with its token IDs and request number.
 
 Prompts are prefilled one at a time, pausing decode. Each decode step packs one token from every active sequence into the shared buffers. Attention reads only that sequence's cache; requests can have different prompt and output lengths. Continuous batching immediately reuses finished slots, while static batching admits the next group after the current group finishes.
 

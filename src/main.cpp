@@ -31,6 +31,18 @@ using json = nlohmann::json;
 // They were implemented in kernels.cu.
 #include "kernels.cuh"
 
+// Kept here so the paged decode path needs no additional header file.
+cudaError_t launchPagedAttention(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *kv_cache,
+    const int *block_tables,
+    const int *position_ids,
+    __nv_bfloat16 *output,
+    int token_count,
+    int layer,
+    int pages_per_layer,
+    int page_tokens);
+
 int checkGPUStatus()
 {
     int device_count = 0;
@@ -70,6 +82,7 @@ constexpr int QUERY_HEADS_PER_KV_HEAD = NUM_QUERY_HEADS / NUM_KV_HEADS;
 constexpr int KV_PAGE_TOKENS = 16;
 constexpr int MAX_KV_PAGES_PER_LAYER =
     (MAX_SEQUENCE_LENGTH + KV_PAGE_TOKENS - 1) / KV_PAGE_TOKENS;
+constexpr int END_OF_MESSAGE_TOKEN_ID = 128008; // <|eom_id|>
 
 static_assert(HIDDEN_SIZE % HEAD_DIM == 0);
 static_assert(KV_DIM % HEAD_DIM == 0);
@@ -305,7 +318,7 @@ struct LLamaWeights
 };
 
 // Each entry maps one layer's logical page to a physical page in the shared pool.
-// This stays on the CPU while attention still uses the existing cuBLAS path.
+// Decode uploads these tables in the same row order as the active tokens.
 struct KVBlockTable
 {
     std::array<std::array<int, MAX_KV_PAGES_PER_LAYER>, N_LAYERS> layers;
@@ -407,6 +420,7 @@ struct InferenceBuffers
     int *token_ids_gpu = nullptr;
     int *position_ids_gpu = nullptr;
     int *next_tokens_gpu = nullptr;
+    int *kv_block_tables_gpu = nullptr;
     __nv_bfloat16 *activations_gpu = nullptr;
     __nv_bfloat16 *normalized_gpu = nullptr;
     __nv_bfloat16 *projection_gpu = nullptr;
@@ -784,8 +798,8 @@ int appendKvCache(KVCache &cache, int layer,
     return 0;
 }
 
-// Bridge paged storage to the existing dense attention operations. These are
-// shared scratch rows, not a second persistent cache for each sequence/layer.
+// Dense reference helper for reading back a paged prefix. Decode now reads the
+// pages directly, so it no longer needs to gather these shared scratch rows.
 int gatherKvCache(const KVCache &cache, int layer, int token_count,
                   __nv_bfloat16 *keys, __nv_bfloat16 *values)
 {
@@ -826,6 +840,7 @@ void freeInferenceBuffers(InferenceBuffers &buffers)
     cudaFree(buffers.token_ids_gpu);
     cudaFree(buffers.position_ids_gpu);
     cudaFree(buffers.next_tokens_gpu);
+    cudaFree(buffers.kv_block_tables_gpu);
     cudaFree(buffers.activations_gpu);
     cudaFree(buffers.normalized_gpu);
     cudaFree(buffers.projection_gpu);
@@ -1009,9 +1024,9 @@ int prefill(
             HIDDEN_SIZE *
             sizeof(__nv_bfloat16);
 
-        // Decode gathers a full cached prefix into these same K/V scratch buffers.
+        // K/V scratch holds prompt projections or one new row per active sequence.
         const size_t kv_buffer_bytes =
-            static_cast<size_t>(MAX_SEQUENCE_LENGTH) * KV_DIM * sizeof(__nv_bfloat16);
+            static_cast<size_t>(buffers.token_capacity) * KV_DIM * sizeof(__nv_bfloat16);
 
         // Create Q/K/V buffers and the cuBLAS handle once, then reuse them.
         if (layer == 0 &&
@@ -1101,15 +1116,14 @@ int prefill(
         // matrix and maps to KV head query_head / 4.
         const size_t attention_score_bytes =
             static_cast<size_t>(NUM_QUERY_HEADS) *
-            std::max(static_cast<size_t>(buffers.token_capacity) * buffers.token_capacity,
-                     static_cast<size_t>(MAX_SEQUENCE_LENGTH)) *
+            buffers.token_capacity * buffers.token_capacity *
             sizeof(__nv_bfloat16);
 
         // Q/K/V have consumed the norm; Q is consumed before the output projection.
         attention_output_gpu = normalized_gpu;
         output_projection_gpu = q_gpu;
 
-        // Attention scratch has the same shape in every layer and covers long decode.
+        // Only dense prefill needs this attention-score scratch.
         if (layer == 0 && attention_scores_gpu == nullptr &&
             cudaMalloc(&attention_scores_gpu, attention_score_bytes) != cudaSuccess)
         {
@@ -1339,6 +1353,7 @@ int decode(
         return -1;
     }
     std::vector<int> position_ids_cpu(token_count);
+    KVCachePool *pool = nullptr;
     for (int row = 0; row < token_count; ++row)
     {
         const KVCache *cache = caches[row];
@@ -1348,6 +1363,16 @@ int decode(
             token_ids[row] < 0 || token_ids[row] >= VOCAB_SIZE)
         {
             std::cerr << "invalid decode token or KV cache is empty/full\n";
+            return -1;
+        }
+        if (row == 0)
+        {
+            pool = cache->pool;
+        }
+        if (cache->pool != pool ||
+            std::find(caches.begin(), caches.begin() + row, cache) != caches.begin() + row)
+        {
+            std::cerr << "decode requires distinct sequences from one KV pool\n";
             return -1;
         }
         position_ids_cpu[row] = cache->length;
@@ -1361,6 +1386,39 @@ int decode(
         }
     }
 
+    // Pack by active row, not scheduler slot: a finished slot may disappear or
+    // be reused while another sequence keeps decoding. Reserve above first so
+    // a newly crossed page boundary is included in this upload.
+    const size_t table_entries_per_sequence =
+        static_cast<size_t>(N_LAYERS) * MAX_KV_PAGES_PER_LAYER;
+    std::vector<int> block_tables_cpu(token_count * table_entries_per_sequence);
+    for (int row = 0; row < token_count; ++row)
+    {
+        const int page_count = (position_ids_cpu[row] + 1 + KV_PAGE_TOKENS - 1) / KV_PAGE_TOKENS;
+        for (int layer = 0; layer < N_LAYERS; ++layer)
+        {
+            const auto &pages = caches[row]->block_table.layers[layer];
+            if (std::any_of(pages.begin(), pages.begin() + page_count,
+                            [](int page) { return page < 0 || page >= KV_PAGE_COUNT; }))
+            {
+                std::cerr << "decode requires allocated KV pages\n";
+                return -1;
+            }
+            std::copy(pages.begin(), pages.end(),
+                      block_tables_cpu.begin() + row * table_entries_per_sequence +
+                          layer * MAX_KV_PAGES_PER_LAYER);
+        }
+    }
+    if ((buffers.kv_block_tables_gpu == nullptr &&
+         cudaMalloc(&buffers.kv_block_tables_gpu,
+                    BATCH_SIZE * table_entries_per_sequence * sizeof(int)) != cudaSuccess) ||
+        cudaMemcpy(buffers.kv_block_tables_gpu, block_tables_cpu.data(),
+                   block_tables_cpu.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        std::cerr << "decode KV block-table allocation or upload failed\n";
+        return -1;
+    }
+
     int *token_id_gpu = buffers.token_ids_gpu;
     int *position_ids_gpu = buffers.position_ids_gpu;
     __nv_bfloat16 *activations_gpu = buffers.activations_gpu;
@@ -1369,7 +1427,6 @@ int decode(
     __nv_bfloat16 *q_gpu = buffers.projection_gpu;
     __nv_bfloat16 *k_gpu = buffers.k_gpu;
     __nv_bfloat16 *v_gpu = buffers.v_gpu;
-    __nv_bfloat16 *attention_scores_gpu = buffers.attention_scores_gpu;
     // Q/K/V have consumed the norm before attention writes into its buffer.
     __nv_bfloat16 *attention_output_gpu = buffers.normalized_gpu;
     __nv_bfloat16 *output_projection_gpu = buffers.projection_gpu;
@@ -1423,24 +1480,14 @@ int decode(
             }
         }
 
-        // Save every packed new row before gathering overwrites K/V scratch.
-        for (int row = 0; row < token_count; ++row)
+        // Each query reads its own pages, including the newly appended token.
+        // Online softmax accumulates the weighted values without storing scores.
+        if (launchPagedAttention(q_gpu, pool->data, buffers.kv_block_tables_gpu,
+                                 position_ids_gpu, attention_output_gpu, token_count,
+                                 layer, MAX_KV_PAGES_PER_LAYER, KV_PAGE_TOKENS) != cudaSuccess)
         {
-            const KVCache &cache = *caches[row];
-            const int key_count = cache.length + 1;
-            // Each query attends only to its sequence's processed positions.
-            // There are no future positions, so decode needs no mask.
-            if (gatherKvCache(cache, layer, key_count, k_gpu, v_gpu) != 0 ||
-                computeGqaAttentionScores(cublas_handle, q_gpu + row * HIDDEN_SIZE, k_gpu,
-                                          attention_scores_gpu, 1, key_count) != CUBLAS_STATUS_SUCCESS ||
-                launchStableSoftmax(attention_scores_gpu, 1, NUM_QUERY_HEADS,
-                                    key_count) != cudaSuccess ||
-                mixGqaValues(cublas_handle, attention_scores_gpu, v_gpu,
-                             attention_output_gpu + row * HIDDEN_SIZE, 1, key_count) != CUBLAS_STATUS_SUCCESS)
-            {
-                std::cerr << "decode attention failed\n";
-                return -1;
-            }
+            std::cerr << "decode paged attention failed\n";
+            return -1;
         }
 
         if (projectBf16RowMajor(cublas_handle, attention_output_gpu, weights.w_o[layer],
@@ -1559,7 +1606,8 @@ int generateRequests(
         const int request_index = slot_requests[slot];
         Request &request = requests[request_index];
         const bool stop = request.next_token_id == tokenizer.eot_id() ||
-                          request.next_token_id == tokenizer.eos_id();
+                          request.next_token_id == tokenizer.eos_id() ||
+                          request.next_token_id == END_OF_MESSAGE_TOKEN_ID;
         if (!stop)
         {
             request.generated_tokens.push_back(request.next_token_id);

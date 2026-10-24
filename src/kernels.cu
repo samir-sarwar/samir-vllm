@@ -1,6 +1,7 @@
 #include "kernels.cuh"
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace
@@ -402,6 +403,97 @@ __global__ void stableSoftmaxKernel(
     }
 }
 
+// Each block attends one decode query head to its sequence's cached K/V.
+// One thread owns one of the head's 64 output values.
+__global__ void pagedAttentionKernel(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *kv_cache,
+    const int *block_tables,
+    const int *position_ids,
+    __nv_bfloat16 *output,
+    int layer,
+    int pages_per_layer,
+    int page_tokens)
+{
+    constexpr int HEAD_SIZE = 64;
+    constexpr int KV_SIZE = 512;
+    constexpr int LAYER_COUNT = 16;
+    constexpr int GQA_RATIO = 4;
+    __shared__ float dot_products[2];
+
+    const int row = blockIdx.x;
+    const int query_head = blockIdx.y;
+    const int thread = threadIdx.x;
+    const int kv_head = query_head / GQA_RATIO;
+    const size_t output_index =
+        static_cast<size_t>(row) * HIDDEN_SIZE +
+        query_head * HEAD_SIZE + thread;
+    const float query = __bfloat162float(q[output_index]);
+    const int key_count = position_ids[row] + 1;
+    const int page_count = (key_count - 1) / page_tokens + 1;
+    const size_t table_start =
+        (static_cast<size_t>(row) * LAYER_COUNT + layer) *
+        pages_per_layer;
+    const size_t values_per_half_page =
+        static_cast<size_t>(page_tokens) * KV_SIZE;
+
+    float running_max = -CUDART_INF_F;
+    float denominator = 0.0f;
+    float weighted_value = 0.0f;
+
+    for (int logical_page = 0; logical_page < page_count; ++logical_page)
+    {
+        const int physical_page = block_tables[table_start + logical_page];
+        const size_t page_start =
+            static_cast<size_t>(physical_page) * values_per_half_page * 2;
+        const int tokens_in_page =
+            min(page_tokens, key_count - logical_page * page_tokens);
+
+        for (int token = 0; token < tokens_in_page; ++token)
+        {
+            const size_t key_index =
+                page_start + static_cast<size_t>(token) * KV_SIZE +
+                kv_head * HEAD_SIZE + thread;
+            float dot_product = query * __bfloat162float(kv_cache[key_index]);
+
+            // Reduce each warp's half of Q.K, then combine the two sums.
+            for (int stride = 16; stride > 0; stride >>= 1)
+            {
+                dot_product += __shfl_down_sync(0xffffffffu, dot_product, stride);
+            }
+            if (thread % 32 == 0)
+            {
+                dot_products[thread / 32] = dot_product;
+            }
+            __syncthreads();
+
+            if (thread == 0)
+            {
+                dot_products[0] = (dot_products[0] + dot_products[1]) / 8.0f;
+            }
+            __syncthreads();
+
+            // Rescale the previous sums when a larger score arrives. Scores
+            // and probabilities stay in FP32 registers rather than buffers.
+            const float score = dot_products[0];
+            const float next_max = fmaxf(running_max, score);
+            const float correction = expf(running_max - next_max);
+            const float weight = expf(score - next_max);
+            denominator = denominator * correction + weight;
+            weighted_value = weighted_value * correction +
+                weight * __bfloat162float(
+                    kv_cache[key_index + values_per_half_page]);
+            running_max = next_max;
+
+            // Both warps must consume this score before the next token
+            // overwrites their shared dot products.
+            __syncthreads();
+        }
+    }
+
+    output[output_index] = __float2bfloat16(weighted_value / denominator);
+}
+
 __global__ void residualAddKernel(
     __nv_bfloat16 *hidden_state,
     const __nv_bfloat16 *update,
@@ -631,6 +723,45 @@ cudaError_t launchStableSoftmax(
     stableSoftmaxKernel<<<row_count, THREADS_PER_BLOCK>>>(
         scores,
         key_count);
+
+    return cudaGetLastError();
+}
+
+cudaError_t launchPagedAttention(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *kv_cache,
+    const int *block_tables,
+    const int *position_ids,
+    __nv_bfloat16 *output,
+    int token_count,
+    int layer,
+    int pages_per_layer,
+    int page_tokens)
+{
+    if (token_count == 0)
+    {
+        return cudaSuccess;
+    }
+
+    if (q == nullptr || kv_cache == nullptr || block_tables == nullptr ||
+        position_ids == nullptr || output == nullptr ||
+        token_count < 0 || token_count > 2 || layer < 0 || layer >= 16 ||
+        pages_per_layer <= 0 || page_tokens <= 0 ||
+        static_cast<size_t>(pages_per_layer) * page_tokens >
+            static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    pagedAttentionKernel<<<dim3(token_count, 32), 64>>>(
+        q,
+        kv_cache,
+        block_tables,
+        position_ids,
+        output,
+        layer,
+        pages_per_layer,
+        page_tokens);
 
     return cudaGetLastError();
 }
