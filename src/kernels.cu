@@ -1,4 +1,5 @@
 #include "kernels.cuh"
+#include <math_constants.h>
 
 #include <cmath>
 #include <limits>
@@ -745,7 +746,7 @@ cudaError_t launchPagedAttention(
 
     if (q == nullptr || kv_cache == nullptr || block_tables == nullptr ||
         position_ids == nullptr || output == nullptr ||
-        token_count < 0 || token_count > 2 || layer < 0 || layer >= 16 ||
+        token_count < 0 || layer < 0 || layer >= 16 ||
         pages_per_layer <= 0 || page_tokens <= 0 ||
         static_cast<size_t>(pages_per_layer) * page_tokens >
             static_cast<size_t>(std::numeric_limits<int>::max()))

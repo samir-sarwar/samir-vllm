@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <stdexcept>
+#include <limits>
 #include "tokenizer.hpp"
 
 // Local alias.
@@ -74,7 +75,6 @@ constexpr int KV_DIM = 512;
 constexpr int INTERMEDIATE_SIZE = 8192;
 constexpr int VOCAB_SIZE = 128256;
 constexpr int MAX_SEQUENCE_LENGTH = 2048;
-constexpr int BATCH_SIZE = 2;
 constexpr int HEAD_DIM = 64;
 constexpr int NUM_QUERY_HEADS = HIDDEN_SIZE / HEAD_DIM;
 constexpr int NUM_KV_HEADS = KV_DIM / HEAD_DIM;
@@ -393,13 +393,19 @@ struct KVPageAllocator
 };
 
 // A physical page holds [16 tokens of K, 16 tokens of V] for one layer.
-// Keep the same total KV memory budget as the old two contiguous caches.
+// The pool budget is independent of how many requests share it.
 constexpr size_t KV_PAGE_VALUES = static_cast<size_t>(KV_PAGE_TOKENS) * KV_DIM;
-constexpr int KV_PAGE_COUNT = BATCH_SIZE * N_LAYERS * MAX_KV_PAGES_PER_LAYER;
+constexpr size_t KV_PAGE_BYTES = 2 * KV_PAGE_VALUES * sizeof(__nv_bfloat16);
+constexpr size_t DEFAULT_KV_CACHE_BYTES = 128 * 1024 * 1024;
+constexpr int KV_PAGE_COUNT = DEFAULT_KV_CACHE_BYTES / KV_PAGE_BYTES;
 struct KVCachePool
 {
     __nv_bfloat16 *data = nullptr;
-    KVPageAllocator allocator{KV_PAGE_COUNT};
+    int page_count;
+    KVPageAllocator allocator;
+
+    explicit KVCachePool(int pages = KV_PAGE_COUNT)
+        : page_count(pages), allocator(pages) {}
 };
 
 // One sequence owns a block table, but borrows physical pages from the pool.
@@ -417,6 +423,8 @@ struct InferenceBuffers
 {
     cublasHandle_t cublas_handle = nullptr;
     int token_capacity = 0;
+    int batch_capacity = 0;
+    int prefill_capacity = 0;
     int *token_ids_gpu = nullptr;
     int *position_ids_gpu = nullptr;
     int *next_tokens_gpu = nullptr;
@@ -775,7 +783,7 @@ int appendKvCache(KVCache &cache, int layer,
         const int position = cache.length + copied;
         const int offset = position % KV_PAGE_TOKENS;
         const int page = cache.block_table.layers[layer][position / KV_PAGE_TOKENS];
-        if (page < 0 || page >= KV_PAGE_COUNT)
+        if (page < 0 || page >= cache.pool->page_count)
         {
             std::cerr << "KV append requires an allocated page\n";
             return -1;
@@ -813,7 +821,7 @@ int gatherKvCache(const KVCache &cache, int layer, int token_count,
     for (int position = 0; position < token_count; position += KV_PAGE_TOKENS)
     {
         const int page = cache.block_table.layers[layer][position / KV_PAGE_TOKENS];
-        if (page < 0 || page >= KV_PAGE_COUNT)
+        if (page < 0 || page >= cache.pool->page_count)
         {
             std::cerr << "KV gather requires an allocated page\n";
             return -1;
@@ -870,6 +878,8 @@ int prefill(
     if (token_ids.empty() ||
         token_ids.size() > MAX_SEQUENCE_LENGTH ||
         token_ids.size() > static_cast<size_t>(buffers.token_capacity) ||
+        token_ids.size() > static_cast<size_t>(buffers.prefill_capacity) ||
+        buffers.batch_capacity <= 0 ||
         cache.pool == nullptr || cache.pool->data == nullptr ||
         cache.capacity <= 0 || cache.capacity > MAX_SEQUENCE_LENGTH ||
         token_ids.size() > static_cast<size_t>(cache.capacity) ||
@@ -1116,7 +1126,7 @@ int prefill(
         // matrix and maps to KV head query_head / 4.
         const size_t attention_score_bytes =
             static_cast<size_t>(NUM_QUERY_HEADS) *
-            buffers.token_capacity * buffers.token_capacity *
+            buffers.prefill_capacity * buffers.prefill_capacity *
             sizeof(__nv_bfloat16);
 
         // Q/K/V have consumed the norm; Q is consumed before the output projection.
@@ -1288,9 +1298,9 @@ int prefill(
     }
 
     if ((logits_gpu == nullptr &&
-         cudaMalloc(&logits_gpu, BATCH_SIZE * VOCAB_SIZE * sizeof(float)) != cudaSuccess) ||
+         cudaMalloc(&logits_gpu, static_cast<size_t>(buffers.batch_capacity) * VOCAB_SIZE * sizeof(float)) != cudaSuccess) ||
         (next_token_gpu == nullptr &&
-         cudaMalloc(&next_token_gpu, BATCH_SIZE * sizeof(int)) != cudaSuccess))
+         cudaMalloc(&next_token_gpu, static_cast<size_t>(buffers.batch_capacity) * sizeof(int)) != cudaSuccess))
     {
         std::cerr << "LM head buffer allocation failed\n";
         free_prefill_buffers();
@@ -1344,7 +1354,7 @@ int decode(
     std::vector<float> *logits_cpu = nullptr)
 {
     const int token_count = static_cast<int>(token_ids.size());
-    if (token_count <= 0 || token_count > BATCH_SIZE ||
+    if (token_count <= 0 || token_count > buffers.batch_capacity ||
         token_count > buffers.token_capacity || token_ids.size() != caches.size() ||
         buffers.cublas_handle == nullptr ||
         cos_table_gpu == nullptr || sin_table_gpu == nullptr)
@@ -1399,7 +1409,7 @@ int decode(
         {
             const auto &pages = caches[row]->block_table.layers[layer];
             if (std::any_of(pages.begin(), pages.begin() + page_count,
-                            [](int page) { return page < 0 || page >= KV_PAGE_COUNT; }))
+                            [pool](int page) { return page < 0 || page >= pool->page_count; }))
             {
                 std::cerr << "decode requires allocated KV pages\n";
                 return -1;
@@ -1411,7 +1421,7 @@ int decode(
     }
     if ((buffers.kv_block_tables_gpu == nullptr &&
          cudaMalloc(&buffers.kv_block_tables_gpu,
-                    BATCH_SIZE * table_entries_per_sequence * sizeof(int)) != cudaSuccess) ||
+                    static_cast<size_t>(buffers.batch_capacity) * table_entries_per_sequence * sizeof(int)) != cudaSuccess) ||
         cudaMemcpy(buffers.kv_block_tables_gpu, block_tables_cpu.data(),
                    block_tables_cpu.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess)
     {
@@ -1565,18 +1575,85 @@ int generateRequests(
     Tokenizer &tokenizer,
     const float *cos_table_gpu,
     const float *sin_table_gpu,
-    bool continuous_batching)
+    bool continuous_batching,
+    int page_count = KV_PAGE_COUNT,
+    bool show_stats = false)
 {
-    KVCachePool pool;
-    if (cudaMalloc(&pool.data, static_cast<size_t>(KV_PAGE_COUNT) *
-                                   2 * KV_PAGE_VALUES * sizeof(__nv_bfloat16)) != cudaSuccess)
+    if (requests.empty() || page_count < N_LAYERS)
+    {
+        std::cerr << "generation requires requests and at least one KV page per layer\n";
+        return -1;
+    }
+    // Account for each request's maximum processed prefix. The final predicted
+    // token is returned without being appended, hence the subtraction by one.
+    // These credits guarantee completion; actual pages are still assigned lazily.
+    std::vector<int> required_pages(requests.size());
+    int prefill_capacity = 0;
+    for (size_t index = 0; index < requests.size(); ++index)
+    {
+        const Request &request = requests[index];
+        if (request.prompt_tokens.empty() || request.prompt_tokens.size() > MAX_SEQUENCE_LENGTH ||
+            request.token_budget <= 0 || request.token_budget > MAX_SEQUENCE_LENGTH)
+        {
+            std::cerr << "invalid request token budget\n";
+            return -1;
+        }
+        const int cached_tokens = static_cast<int>(request.prompt_tokens.size()) + request.token_budget - 1;
+        prefill_capacity = std::max(prefill_capacity, static_cast<int>(request.prompt_tokens.size()));
+        required_pages[index] = ((cached_tokens + KV_PAGE_TOKENS - 1) / KV_PAGE_TOKENS) * N_LAYERS;
+        if (cached_tokens > MAX_SEQUENCE_LENGTH || required_pages[index] > page_count)
+        {
+            std::cerr << "request " << index + 1 << " needs " << required_pages[index]
+                      << " KV pages for its token budget, but the pool has " << page_count
+                      << "; reduce max_new_tokens or increase --kv-cache-mib\n";
+            return -1;
+        }
+    }
+
+    // Bound scratch by the largest group that could fit, rather than a fixed
+    // request limit. Sorting is only for sizing; admission below remains FIFO.
+    std::vector<int> sorted_pages = required_pages;
+    std::sort(sorted_pages.begin(), sorted_pages.end());
+    int slot_count = 0;
+    int sizing_pages = 0;
+    for (int pages : sorted_pages)
+    {
+        if (pages > page_count - sizing_pages)
+        {
+            break;
+        }
+        sizing_pages += pages;
+        ++slot_count;
+    }
+    const int token_capacity = std::max(prefill_capacity, slot_count);
+    // A caller may reuse buffers for another workload. Grow all allocations
+    // together; changing capacities alone would leave old, smaller GPU buffers.
+    if (buffers.batch_capacity < slot_count || buffers.prefill_capacity < prefill_capacity ||
+        buffers.token_capacity < token_capacity)
+    {
+        freeInferenceBuffers(buffers);
+    }
+    buffers.batch_capacity = std::max(buffers.batch_capacity, slot_count);
+    buffers.prefill_capacity = std::max(buffers.prefill_capacity, prefill_capacity);
+    buffers.token_capacity = std::max(buffers.token_capacity, token_capacity);
+    KVCachePool pool(page_count);
+    if (cudaMalloc(&pool.data, static_cast<size_t>(page_count) * KV_PAGE_BYTES) != cudaSuccess)
     {
         std::cerr << "KV page pool allocation failed\n";
         return -1;
     }
-    KVCache caches[BATCH_SIZE]{};
-    int slot_requests[BATCH_SIZE];
-    std::fill_n(slot_requests, BATCH_SIZE, -1);
+    std::vector<KVCache> caches(slot_count);
+    std::vector<int> slot_requests(slot_count, -1);
+    int committed_pages = 0;
+    int active_count = 0;
+    int peak_active = 0;
+    int max_decode_batch = 0;
+    size_t peak_pages = 0;
+    size_t admission_waits = 0;
+    auto record_page_usage = [&]()
+    {
+        peak_pages = std::max(peak_pages, static_cast<size_t>(page_count) - pool.allocator.free_pages.size());
+    };
     std::queue<int> pending;
     for (int request = 0; request < static_cast<int>(requests.size()); ++request)
     {
@@ -1591,7 +1668,7 @@ int generateRequests(
         cudaFree(pool.data);
         pool.data = nullptr;
     };
-    for (int slot = 0; slot < BATCH_SIZE && slot < static_cast<int>(requests.size()); ++slot)
+    for (int slot = 0; slot < slot_count; ++slot)
     {
         if (initializeKvCache(caches[slot], pool) != 0)
         {
@@ -1635,29 +1712,43 @@ int generateRequests(
         }
         slot_requests[slot] = -1;
         freeKvCache(caches[slot]); // Return every layer's pages before reusing the slot.
+        committed_pages -= required_pages[request_index];
+        --active_count;
     };
 
     std::vector<int> active_slots, active_tokens, next_tokens;
     std::vector<KVCache *> active_caches;
-    active_slots.reserve(BATCH_SIZE);
-    active_tokens.reserve(BATCH_SIZE);
-    next_tokens.reserve(BATCH_SIZE);
-    active_caches.reserve(BATCH_SIZE);
+    active_slots.reserve(slot_count);
+    active_tokens.reserve(slot_count);
+    next_tokens.reserve(slot_count);
+    active_caches.reserve(slot_count);
     while (true)
     {
         const bool batch_empty = std::all_of(
-            slot_requests, slot_requests + BATCH_SIZE, [](int request)
+            slot_requests.begin(), slot_requests.end(), [](int request)
             { return request == -1; });
         // Static batches wait for the entire group. Continuous batches refill now.
         if (continuous_batching || batch_empty)
         {
-            for (int slot = 0; slot < BATCH_SIZE; ++slot)
+            bool admission_blocked = false;
+            for (int slot = 0; slot < slot_count && !admission_blocked; ++slot)
             {
                 while (slot_requests[slot] == -1 && !pending.empty())
                 {
                     const int request_index = pending.front();
+                    // FIFO admission leaves enough space for active requests to
+                    // reach their declared budgets, even at future page boundaries.
+                    if (required_pages[request_index] > page_count - committed_pages)
+                    {
+                        ++admission_waits;
+                        admission_blocked = true;
+                        break;
+                    }
                     pending.pop();
                     slot_requests[slot] = request_index;
+                    committed_pages += required_pages[request_index];
+                    ++active_count;
+                    peak_active = std::max(peak_active, active_count);
                     Request &request = requests[request_index];
                     if (prefill(request.prompt_tokens, weights, caches[slot], buffers,
                                 cos_table_gpu, sin_table_gpu, request.next_token_id) != 0)
@@ -1665,6 +1756,7 @@ int generateRequests(
                         free_caches();
                         return -1;
                     }
+                    record_page_usage();
                     accept_token(slot); // The first generated token counts toward the budget.
                     if (!continuous_batching)
                     {
@@ -1677,7 +1769,7 @@ int generateRequests(
         active_slots.clear();
         active_tokens.clear();
         active_caches.clear();
-        for (int slot = 0; slot < BATCH_SIZE; ++slot)
+        for (int slot = 0; slot < slot_count; ++slot)
         {
             if (slot_requests[slot] != -1)
             {
@@ -1694,18 +1786,35 @@ int generateRequests(
             }
             continue;
         }
+        max_decode_batch = std::max(max_decode_batch, static_cast<int>(active_slots.size()));
         if (decode(active_tokens, weights, active_caches, buffers,
                    cos_table_gpu, sin_table_gpu, next_tokens) != 0)
         {
             free_caches();
             return -1;
         }
+        record_page_usage();
         for (int row = 0; row < static_cast<int>(active_slots.size()); ++row)
         {
             const int slot = active_slots[row];
             requests[slot_requests[slot]].next_token_id = next_tokens[row];
             accept_token(slot);
         }
+    }
+    if (committed_pages != 0 || pool.allocator.free_pages.size() != static_cast<size_t>(page_count))
+    {
+        std::cerr << "KV pages were not fully returned after generation\n";
+        free_caches();
+        return -1;
+    }
+    if (show_stats)
+    {
+        std::cout << "Scheduler stats: " << json{
+            {"pool_bytes", static_cast<size_t>(page_count) * KV_PAGE_BYTES},
+            {"pool_pages", page_count}, {"peak_active", peak_active},
+            {"max_decode_batch", max_decode_batch}, {"peak_pages", peak_pages},
+            {"admission_waits", admission_waits},
+            {"final_free_pages", pool.allocator.free_pages.size()}}.dump() << '\n';
     }
     free_caches();
     return 0;
@@ -1717,16 +1826,66 @@ int main(int argc, char **argv)
     // checkGPUStatus();
     int first_arg = 1;
     bool continuous_batching = true;
-    if (argc > 1 && (std::strcmp(argv[1], "--static") == 0 ||
-                     std::strcmp(argv[1], "--continuous") == 0))
+    bool show_stats = false;
+    size_t kv_cache_bytes = DEFAULT_KV_CACHE_BYTES;
+    while (first_arg < argc)
     {
-        continuous_batching = std::strcmp(argv[1], "--static") != 0;
+        const std::string option = argv[first_arg];
+        if (option == "--help")
+        {
+            std::cout << "Usage: samir-vllm [--static|--continuous] [--kv-cache-mib N] [--stats] "
+                         "[prompt] [max_new_tokens] [extra_prompt ...]\n"
+                         "KV pool defaults to 128 MiB; active requests are admitted by their page budgets.\n";
+            return 0;
+        }
+        if (option == "--static" || option == "--continuous")
+        {
+            continuous_batching = option == "--continuous";
+        }
+        else if (option == "--stats")
+        {
+            show_stats = true;
+        }
+        else if (option == "--kv-cache-mib")
+        {
+            try
+            {
+                if (++first_arg == argc)
+                {
+                    throw std::invalid_argument("missing pool size");
+                }
+                const std::string value = argv[first_arg];
+                size_t parsed = 0;
+                const unsigned long long mib = std::stoull(value, &parsed);
+                const size_t max_mib = static_cast<size_t>(std::numeric_limits<int>::max()) *
+                                       KV_PAGE_BYTES / (1024 * 1024);
+                if (value.empty() || value[0] == '-' || parsed != value.size() || mib == 0 || mib > max_mib)
+                {
+                    throw std::invalid_argument("pool size out of range");
+                }
+                kv_cache_bytes = static_cast<size_t>(mib) * 1024 * 1024;
+            }
+            catch (const std::exception &)
+            {
+                std::cerr << "--kv-cache-mib requires a positive integer pool size\n";
+                return -1;
+            }
+        }
+        else if (option == "--")
+        {
+            ++first_arg;
+            break;
+        }
+        else if (option.rfind("--", 0) == 0)
+        {
+            std::cerr << "unknown option: " << option << '\n';
+            return -1;
+        }
+        else
+        {
+            break;
+        }
         ++first_arg;
-    }
-    if (argc > first_arg && std::strcmp(argv[first_arg], "--help") == 0)
-    {
-        std::cout << "Usage: samir-vllm [--static|--continuous] [prompt] [max_new_tokens] [extra_prompt ...]\n";
-        return 0;
     }
     LLamaWeights weights{};
     const std::string prompt = argc > first_arg ? argv[first_arg] : "Hello World!";
@@ -1812,10 +1971,11 @@ int main(int argc, char **argv)
     }
 
     InferenceBuffers buffers{};
-    buffers.token_capacity = std::max(max_prompt_length, BATCH_SIZE);
+    buffers.prefill_capacity = max_prompt_length;
     const int generation_status = generateRequests(
         requests, weights, buffers, tokenizer,
-        cos_table_gpu, sin_table_gpu, continuous_batching);
+        cos_table_gpu, sin_table_gpu, continuous_batching,
+        static_cast<int>(kv_cache_bytes / KV_PAGE_BYTES), show_stats);
 
     freeInferenceBuffers(buffers);
     cudaFree(cos_table_gpu);
