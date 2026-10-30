@@ -1014,3 +1014,70 @@ Decode C and B
 ...
 B keeps its KV history during that pause, so once C is ready we can continue B from where it left off. If C has a long prompt, though, processing it can create a longer gap between B’s output tokens.
 So when we call this continuous batching, we’re talking about the scheduler checking for freed slots between decode iterations and letting waiting requests enter before the whole previous group has finished. Prefill and decode still run one after another in this implementation, and getting them to overlap is something we can work on separately later.
+
+Paged KV Cache
+Up until this point each sequence had its own kv cache allocation with room for all 2048 possible token positions, which made appending the next token pretty straightforward because we already knew where to put its kv. However we were deciding how much memory belonged to the sequence before knowing how much it would actually need. For our model, one processed token needs 32 KiB of KV storage across all 16 layers, so each sequence’s allocation was:
+
+2048 positions × 32 KiB = 64 MiB
+
+Say we are dealing with a n-sequence engine so we can have n many requests but this doesn’t necessarily mean during processing that they end up using all of the allocated memory and thus that memory is in essence wasted there.
+
+With paging you can think of it more as a pool from which we can assign smaller chunks of memory, these chunks would be pages. Say a request exceeds the one allocated page it can be given another one. The scheduler from KV cache is what orchestrates who gets what.
+
+Furthermore, theres another useful thing to mention. An idea you may have had while learning this as I did was why not just start each contiguous cache small and enlarge it? Well unfortunately that isn’t as easy as it may seem, the allocation of memory we make is fixed and not dynamic as you may see with something like an array in python, it has a fixed size, so “Growing” would really mean allocating a larger space, copying everything over, then freeing that old space… yeah alot uglier than just growing. Paging however, lets us add another chunk while leaving the existing data where it is.
+
+Lets say, using the previous system we were contiguously allocating sequences in the order they were given, but it turns out that the first and third req complete before the second, but the fourth requires more space than what was in first or third, this becomes a problem for the scheduler and is another benefit of paging which takes lessons from computer architecture and the concept of virtual memory that I will briefly go over.
+
+The main idea is that the order a program sees data doesn’t have to match where its pieces actually sit in memory. We keep track of the relationship through a mapping.
+
+Say a program has some data occupying twelve consecutive byte addresses. For this example, imagine a page holds four bytes, so we can split that range into three pages:
+Page 0: addresses 0–3
+Page 1: addresses 4–7
+Page 2: addresses 8–11
+These addresses are actually virtual addresses, meaning they are just addr in the space the program works with. They dont actually represent where in RAM those physical bytes actually live. The operating system can then create virtual pages, which hold multiple virtual addresses which actually point to physical frames which are available chunks of physical memory.
+
+That relation, i.e the point from virtual to physical is stored in a page table. When the program accesses memory, the hardware uses the mappings established by the operating system to translate the virtual address into a physical address. An important add-on is that positioning/offset within the page is same for virtual and physical, so in this example say we are looking at byte 10, given each page is a byte, 10/4 = 2 meaning page 2 and 10 % 4 = 2 meaning offset 2 bytes within this page, both virtually and within the physical frame.
+Now lets connect this to our KV cache. We borrow a similar idea but instead of the OS, our code within the engine handles the mapping itself. We divide a sequence’s history into logical pages of 16 token positions, and each page holds the K/V vectors for those positions in one layer. So suppose its block table contains:
+Logical page 0 → physical KV page 5
+Logical page 1 → physical KV page 1
+Logical page 2 → physical KV page 7
+The history would still follow Positions 0–15 → positions 16–31 → positions 32–47. Its storage can be scattered around the pool. To find position 33, we calculate: Logical page: 33 / 16 = 2 Offset: 33 % 16 = 1. Then we look up logical page 2, get physical KV page 7, and access the second token position inside that page. Now, those two pages don’t have to sit beside each other in GPU memory. Maybe the first piece is stored in pool slot 7and the second in slot 2.
+By using a block table within the code it also keeps order telling us which part of the requests history is in which slot so when attention needs it we can just follow.
+Pretty much the tldr is that the cache is the saved KV data, and paging is how you divide up the space that stores the data, in a way that efficiently and effectively allows for more concurrent work to be done.  
+Now if it wasnt already clear, lets look what those pages actually contain and how different requests occupy the same pool. Let’s keep with the allocations in the above examples for simplicity. Suppose request A has processed 34 tokens. Looking at just layer 0, its saved K/V needs three pages
+Logical page 0: positions 0–15
+Logical page 1: positions 16–31
+Logical page 2: positions 32–33, with room for another 14
+The block table for req A would then say layer 0: [5, 1, 7]. So essentially we’ve put the first part of its history in pool slot 5,the next part in slot 1, and the final part in slot 7.
+Now suppose request B has processed 20 tokens. It would need two pages for this layer, and we give it different slots, say, layer 0: [2, 6]
+So from our shared pool of say from slots 0 - 8, we can see how the requests KV cache data is not contiguous within VRAM, rather one pool of memory for all kv cache data is paged. Their block tables keep the histories separate and ordered
+To nail home the concept of growing into the space, lets look at slot 7, it has 2 processed tokens and so if we look back at how a slot is partitioned we have equal space for key and value vector. Thus 2 for key, and 2 for value in our case. Each K or V box represents a whole 512-value vector. The page has space for 16 key vectors and 16 matching value vectors, even though only two positions currently contain valid history.
+Those remaining positions stay available for A to grow into. B can receive another free page, but it can’t borrow individual unused positions inside A’s page.
+This is also why we track A’s cache length as 34. Three pages provide capacity for 48 positions, but attention should only read the 34 positions we’ve actually processed.
+This example though was only layer 0. Layer 1 produces its own KV, so A has a whole other set of mappings for that layer, and we repeat that across all 16 layers. The shared pool holds the actual vectors and each sequence’s block table records where its pieces live.
+So now we can look at how attention uses the current token’s query to go through its saved history, and we’ll keep using request A for this. We’ve already processed 34 tokens, meaning positions 0–33 are in the cache, so the next token we process goes at position 34. We calculate its Q, K and V, apply RoPE to Q and K, then append its K and V to the cache before running attention, giving us 35 valid positions. The query we’re following belongs to position 34, and it can attend to everything from position 0 through 34, including itself.
+First the kernel selects A’s block table for layer 0. Remember we upload the block tables in the same packed row order as the queries, meaning each query stays matched with the correct request even when the requests in the batch change. From there we start at logical page 0, which points to physical page 5 in the GPU pool, so that’s where we read the cached keys and values for positions 0–15. For each position we compare the current query with that position’s key to calculate an attention score, which we then use when working out how much its value contributes to the result.
+One thing to remember here is that we’re following one query head, and each cached K/V row contains all eight KV heads, so we need to select the matching 64-value slice using the GQA relationship we’ve already looked at. For example, query head 9 uses KV head 2, meaning we take the 64 values belonging to head 2 from the K row, and the matching 64 values from the V row.
+Then, once it finishes the first page, it looks up the next logical page. Nothing about the actual query changes here, its just that the next part lives somewhere else in the gpu.
+One important thing to note that tripped me up at first as well, when we go from page to page, it doesnt mean that attention restarts. The kernel carries its running attention state across all of its pages, producing one result over the whole valid history. How we’re actually able to do that is Online Softmax which is what i’ll explain next.
+Pretty much Online softmax lets us build the attention result one position at a time, keeping a small summary of everything we’ve already read. Through the positions continuing through each page we keep computing values like a Running max which would have the largest score seen so far. We subtract this when calculating exponentials to keep the numbers manageable. Furthermore, the total weight accumulated so far which would be the denominator.As well as the weighted-value sum which are the values accumulated so far, each multiplied by its weight. So the end would look like Attention output = weighted-value sum / denominator.
+
+Let’s go through a small example, say our query gets scores of 1, 2 and 1 when we compare it with three cached keys, and their corresponding values are 10, 20 and 40. We’re using a single number for each value here so we can follow the calculation, remember though in our actual model each head has 64 values, so we do the same weighted accumulation for each of those components.
+Starting with the first position, its score is 1, so our running maximum becomes 1. We subtract that maximum from the score before taking the exponential, giving us:
+weight = exp(1 − 1) = 1
+This is the weight before normalization, meaning we haven’t divided it by the total weight yet. So our denominator starts at 1, and our weighted-value sum starts at:
+weighted-value sum = 1 × 10 = 10
+Now we move to the second position, which has a score of 2 and a value of 20. Since 2 is larger than our previous maximum, we update the running maximum to 2, but this also changes the scale we’re using for our weights. The first weight was calculated by subtracting 1, whereas now we’re subtracting 2, so that earlier weight needs to become:
+previous weight = exp(1 − 2) ≈ 0.368
+So how do we fix what we’ve already accumulated? We multiply both our existing denominator and our existing weighted-value sum by exp(old maximum − new maximum), which here is approximately 0.368. This brings everything we’ve already processed onto the new scale, and we can do that using just those running totals, without going back and reading the earlier value again.
+The second position’s own weight is exp(2 − 2) = 1, so after adjusting the old totals and adding this new contribution, we get:
+denominator = 1 × 0.368 + 1 ≈ 1.368
+weighted-value sum = 10 × 0.368 + 20 × 1 ≈ 23.68
+From there we move to the third position, which has a score of 1 and a value of 40. Our running maximum stays at 2 because this score is smaller, meaning the earlier totals are already on the correct scale, so we can calculate the new weight and add its contribution directly:
+weight = exp(1 − 2) ≈ 0.368
+denominator = 1.368 + 0.368 ≈ 1.736
+weighted-value sum = 23.68 + 0.368 × 40 ≈ 38.40
+Now that we’ve processed all three positions, we divide the weighted-value sum by the denominator:
+attention output ≈ 38.40 / 1.736 ≈ 22.12
+That division is what normalizes the weights, so the result is a weighted average of our values. We’ve kept track of the total weight and the weighted contributions as we go, with the running maximum letting us keep those calculations numerically stable.
+And this carries straight across our page boundaries too, so when we finish reading physical page 5 and follow the block table to physical page 1, we keep the same running maximum, denominator and weighted-value sum, then continue updating them as we read the next positions. Moving to another page changes where we read the keys and values from, while those totals keep accumulating until we’ve processed the query’s entire valid history.
