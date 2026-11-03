@@ -1,6 +1,8 @@
 # RMSNorm Kernel — Part 3 Video Notes
 
-Video: [Writing the RMSNorm kernel](https://youtu.be/my8VrOUVWo0). This picks up after [embedding gather](youtubePT2_embedding_gather_notes.md). The code to read alongside it is [`rmsNormKernel` and `launchRmsNorm` in `src/kernels.cu`](../src/kernels.cu), called from [`prefill` in `src/main.cpp`](../src/main.cpp).
+Video: [Writing the RMSNorm kernel](https://youtu.be/my8VrOUVWo0). This picks up after [embedding gather](youtubePT2_embedding_gather_notes.md). The code to read alongside it is [`rmsNormKernel` and `launchRmsNorm` in `src/kernels.cu`](../../src/kernels.cu), called from [`prefill` in `src/main.cpp`](../../src/main.cpp).
+
+The host snippets describe the Part 3 milestone, when prefill stopped after the first norm. The current engine reuses this kernel throughout all 16 layers, the final norm, and decode, with persistent scratch buffers.
 
 ## What this video is covering
 
@@ -66,7 +68,7 @@ launchRmsNorm(
     token_count);
 ```
 
-`weights.input_layernorm[0]` points into the big weight allocation loaded at startup. It is a vector of 2,048 BF16 learned values. We do not copy the weights again for this prompt. The `0` matters: this video works with the **first** layer's input norm. The current code continues into attention for layer 0, while a full forward pass would loop over all 16 layers and use the corresponding norm vector each time.
+`weights.input_layernorm[0]` points into the big weight allocation loaded at startup. It is a vector of 2,048 BF16 learned values. We do not copy the weights again for this prompt. The `0` matters: this video works with the **first** layer's input norm. The completed forward pass loops over all 16 layers and selects the corresponding norm vector each time.
 
 ## The CUDA mapping: one block per token
 
@@ -167,7 +169,7 @@ Notice the two meanings of "weight" here. `activations_gpu` holds prompt-depende
 
 ## What this code does today, and what comes next
 
-The kernel is reusable for any token count with this fixed 2,048 hidden width. At this video's milestone, `prefill` called it only for layer 0's first norm; Q/K/V projection was the next step. The later [Q/K/V notes](youtubePT5_qkv_projection_notes.md) show how the current code uses `normalized_gpu` as that projection input. The engine still does not produce a next-token prediction.
+The kernel is reusable for any token count with this fixed 2,048 hidden width. At this video's milestone, `prefill` called it only for layer 0's first norm; Q/K/V projection was the next step. The later [Q/K/V notes](youtubePT5_qkv_projection_notes.md) show how `normalized_gpu` becomes that projection input. [Part 7](youtubePT7_feed_forward_swiglu_mlp.md) completes the forward pass and produces the first next-token prediction.
 
 The thing to keep in mind from this video:
 

@@ -8,26 +8,32 @@ The series follows what happens between a prompt and a generated token, from loa
 
 <table width="100%">
 <tr>
-<td align="center" width="50%"><a href="https://youtu.be/ef0mOukUE6U"><img src="https://img.youtube.com/vi/ef0mOukUE6U/maxresdefault.jpg" width="300" alt="Part 0: AI inference explained"><br><strong>Part 0 · AI inference explained</strong></a></td>
-<td align="center" width="50%"><a href="https://youtu.be/39_gWVbYgB4"><img src="https://img.youtube.com/vi/39_gWVbYgB4/maxresdefault.jpg" width="300" alt="Part 1: Loading SafeTensor weights"><br><strong>Part 1 · Loading model weights</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/ef0mOukUE6U" title="Follow a prompt through an LLM, from tokenization to predicting the next token."><img src="https://img.youtube.com/vi/ef0mOukUE6U/maxresdefault.jpg" width="300" alt="Part 0: AI inference explained"><br><strong>Part 0 · AI inference explained</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/39_gWVbYgB4" title="Read SafeTensor metadata and load the Llama model weights into GPU memory."><img src="https://img.youtube.com/vi/39_gWVbYgB4/maxresdefault.jpg" width="300" alt="Part 1: Loading SafeTensor weights"><br><strong>Part 1 · Loading model weights</strong></a></td>
 </tr>
 <tr>
-<td align="center" width="50%"><a href="https://youtu.be/0V1lVIzGyqs"><img src="https://img.youtube.com/vi/0V1lVIzGyqs/maxresdefault.jpg" width="300" alt="Part 2: Embedding gather kernel"><br><strong>Part 2 · Embedding gather</strong></a></td>
-<td align="center" width="50%"><a href="https://youtu.be/my8VrOUVWo0"><img src="https://img.youtube.com/vi/my8VrOUVWo0/maxresdefault.jpg" width="300" alt="Part 3: RMSNorm kernel"><br><strong>Part 3 · RMSNorm</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/0V1lVIzGyqs" title="Write a CUDA gather kernel that turns token IDs into embedding vectors."><img src="https://img.youtube.com/vi/0V1lVIzGyqs/maxresdefault.jpg" width="300" alt="Part 2: Embedding gather kernel"><br><strong>Part 2 · Embedding gather</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/my8VrOUVWo0" title="Normalize hidden states with RMSNorm and implement the CUDA reduction from scratch."><img src="https://img.youtube.com/vi/my8VrOUVWo0/maxresdefault.jpg" width="300" alt="Part 3: RMSNorm kernel"><br><strong>Part 3 · RMSNorm</strong></a></td>
 </tr>
 <tr>
-<td align="center" width="50%"><a href="https://youtu.be/4gL0hd9UEAY"><img src="https://img.youtube.com/vi/4gL0hd9UEAY/maxresdefault.jpg" width="300" alt="Part 4: Rotary position embeddings"><br><strong>Part 4 · RoPE</strong></a></td>
-<td align="center" width="50%"><a href="https://youtu.be/8_HJH7pbw78"><img src="https://img.youtube.com/vi/8_HJH7pbw78/maxresdefault.jpg" width="300" alt="Part 5: Q, K, and V projections with cuBLAS"><br><strong>Part 5 · Q/K/V with cuBLAS</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/4gL0hd9UEAY" title="Understand rotary position embeddings and write the CUDA kernel for rotating query and key vectors."><img src="https://img.youtube.com/vi/4gL0hd9UEAY/maxresdefault.jpg" width="300" alt="Part 4: Rotary position embeddings"><br><strong>Part 4 · RoPE</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/8_HJH7pbw78" title="Use cuBLAS matrix multiplication to project hidden states into query, key, and value vectors."><img src="https://img.youtube.com/vi/8_HJH7pbw78/maxresdefault.jpg" width="300" alt="Part 5: Q, K, and V projections with cuBLAS"><br><strong>Part 5 · Q/K/V with cuBLAS</strong></a></td>
 </tr>
 <tr>
-<td align="center" width="50%"><a href="https://youtu.be/tTULacSPXkc"><img src="https://img.youtube.com/vi/tTULacSPXkc/maxresdefault.jpg" width="300" alt="Part 6: Multi-head self-attention"><br><strong>Part 6 · Self-attention</strong></a></td>
-<td align="center" width="50%"><a href="https://youtu.be/HjllfB1IPrE"><img src="https://img.youtube.com/vi/HjllfB1IPrE/maxresdefault.jpg" width="300" alt="Part 7: Feed-forward network and SwiGLU"><br><strong>Part 7 · Feed-forward network</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/tTULacSPXkc" title="Build causal self-attention, from query-key scores and softmax to weighted values and the output projection."><img src="https://img.youtube.com/vi/tTULacSPXkc/maxresdefault.jpg" width="300" alt="Part 6: Multi-head self-attention"><br><strong>Part 6 · Self-attention</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/HjllfB1IPrE" title="Implement the SwiGLU feed-forward network, complete all transformer layers, and predict the first next token."><img src="https://img.youtube.com/vi/HjllfB1IPrE/maxresdefault.jpg" width="300" alt="Part 7: Feed-forward network and SwiGLU"><br><strong>Part 7 · Feed-forward network</strong></a></td>
 </tr>
 <tr>
-<td align="center" width="50%"><a href="https://youtu.be/yFwPpH1Hb14"><img src="https://img.youtube.com/vi/yFwPpH1Hb14/maxresdefault.jpg" width="300" alt="Part 8: Decode and KV cache"><br><strong>Part 8 · Decode and KV cache</strong></a></td>
-<td align="center" width="50%"><a href="https://youtu.be/ei3M0Ex0qHA"><img src="https://img.youtube.com/vi/ei3M0Ex0qHA/maxresdefault.jpg" width="300" alt="Part 9: Static and continuous batching"><br><strong>Part 9 · Static and continuous batching</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/yFwPpH1Hb14" title="Separate prefill from decode and reuse cached keys and values to generate a response one token at a time."><img src="https://img.youtube.com/vi/yFwPpH1Hb14/maxresdefault.jpg" width="300" alt="Part 8: Decode and KV cache"><br><strong>Part 8 · Decode and KV cache</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/ei3M0Ex0qHA" title="Generate for multiple requests together and compare static batching with a continuous scheduler."><img src="https://img.youtube.com/vi/ei3M0Ex0qHA/maxresdefault.jpg" width="300" alt="Part 9: Static and continuous batching"><br><strong>Part 9 · Static and continuous batching</strong></a></td>
+</tr>
+<tr>
+<td align="center" width="50%"><a href="https://youtu.be/As13goWXIx8" title="Build a paged KV cache with logical-to-physical block tables, allocate pages as requests grow, and reuse them on completion."><img src="https://img.youtube.com/vi/As13goWXIx8/maxresdefault.jpg" width="300" alt="Part 10: Paged KV cache"><br><strong>Part 10 · Paged KV cache</strong></a></td>
+<td align="center" width="50%"><a href="https://youtu.be/fle2du_R8DI" title="Implement paged attention with online softmax, then connect the CUDA kernel to decode, batching, and page reclamation."><img src="https://img.youtube.com/vi/fle2du_R8DI/maxresdefault.jpg" width="300" alt="Finale: Paged attention"><br><strong>Finale · Paged attention</strong></a></td>
 </tr>
 </table>
+
+Companion notes for every video are in the [study-notes index](proper_notes/README.md), with separate [Markdown](proper_notes/markdown/) and [PDF](proper_notes/pdf/) folders. You can also read the [complete PDF collection](proper_notes/pdf/samir_vllm_complete_study_notes.pdf).
 
 ## What works so far
 
@@ -46,7 +52,7 @@ The series follows what happens between a prompt and a generated token, from loa
 - Static batching and a continuous scheduler that admit queued prompts according to available page budgets, then return their pages and budgets on completion.
 - Direct paged decode attention with FP32 online softmax. Each query head streams its sequence's cached pages and accumulates weighted values without gathering a contiguous prefix or storing attention scores.
 
-Part 8 follows these changes in [Prefill, Decode, and the KV Cache](proper_notes/youtubePT8_prefill_decode_kv_cache.md).
+Part 8 explains [Prefill, Decode, and the KV Cache](proper_notes/markdown/youtubePT8_prefill_decode_kv_cache.md). Part 9 follows with [Static and Continuous Batching](proper_notes/markdown/youtubePT9_static_continuous_batching.md), including the current paged cache and online-softmax decode attention.
 
 ## Current scope
 
@@ -100,7 +106,8 @@ src/           Engine entry point, CUDA kernels, and tokenizer implementation
 include/       Public kernel and tokenizer headers
 tests/         Tokenizer tests
 python/        Tokenizer reference script
-proper_notes/  Notes for the video series
+proper_notes/  Study-notes index, markdown/ sources, and pdf/ reading editions
+scripts/       Rebuild the study-note PDFs
 notes.md       Working notes from the build
 ```
 

@@ -1,5 +1,7 @@
 # Embedding Gather - Video Notes
 
+Companion to [Part 2: Embedding gather](https://youtu.be/0V1lVIzGyqs). The host allocation examples describe this video's milestone. The current engine keeps shared scratch buffers in `InferenceBuffers` across prefill and decode calls; the embedding kernel's lookup and thread mapping are the same.
+
 ## What this video is covering
 
 This is the first actual model operation in the inference engine. We already did the setup work:

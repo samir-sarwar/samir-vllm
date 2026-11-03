@@ -1,6 +1,8 @@
 # Q, K, V Projection with cuBLAS — Part 5 Video Notes
 
-Video: [Computing Query, Key, Value vectors using cuBLAS](https://youtu.be/8_HJH7pbw78). Keep [`projectBf16RowMajor` and `prefill` in `src/main.cpp`](../src/main.cpp) open while reading. [RMSNorm](youtubePT3_rmsnorm_notes.md) explains where the input comes from; [RoPE](youtubePT4_rope_notes.md) explains what happens to Q and K afterward.
+Video: [Computing Query, Key, Value vectors using cuBLAS](https://youtu.be/8_HJH7pbw78). Keep [`projectBf16RowMajor` and `prefill` in `src/main.cpp`](../../src/main.cpp) open while reading. [RMSNorm](youtubePT3_rmsnorm_notes.md) explains where the input comes from; [RoPE](youtubePT4_rope_notes.md) explains what happens to Q and K afterward.
+
+The host snippets describe the Part 5 milestone (`42532af`), before full layers, generation, and batching. Use `git show 42532af:src/main.cpp` for that snapshot. The projection helper's matrix-layout reasoning still applies to the current engine.
 
 ## Where we are in the engine
 
@@ -133,7 +135,7 @@ So the actual call uses `CUBLAS_OP_T`, `CUBLAS_OP_N`, and `(m, n, k) = (O, T, 20
 
 After the three projections, `prefill` calls `launchRope` on `q_gpu` with projection width `2048`, and on `k_gpu` with width `512`. Both use head width `64`, the position IDs, and the precomputed sine/cosine tables. `v_gpu` is left alone. RoPE changes Q/K **activations in place**, so the later Q·K comparisons contain relative-position information.
 
-The host checks cuBLAS return statuses and CUDA launch errors, then synchronizes to catch GPU execution errors. `q_gpu`, `k_gpu`, and `v_gpu` are temporary buffers in this prefill path; they are freed before the function returns. In this part of the series, their next consumer is the layer-0 self-attention code described in [the Part 6 self-attention notes](youtubePT6_self_attention_completion.md).
+The host checks cuBLAS return statuses and CUDA launch errors, then synchronizes to catch GPU execution errors. In the Part 5 snapshot, `q_gpu`, `k_gpu`, and `v_gpu` are temporary prefill buffers freed before the function returns. The current engine keeps projection scratch in persistent `InferenceBuffers` for reuse across calls. In this part of the series, the projections' next consumer is the layer-0 self-attention code described in [the Part 6 self-attention notes](youtubePT6_self_attention_completion.md).
 
 ## What to keep straight while watching
 

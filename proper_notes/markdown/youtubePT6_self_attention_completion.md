@@ -1,6 +1,6 @@
 # Part 6: Finishing the Self-Attention Sublayer
 
-These notes describe the layer-0 attention implementation shown in [Part 6](https://youtu.be/tTULacSPXkc), before the later MLP and decode changes. The source links to [`src/main.cpp`](../src/main.cpp) and [`src/kernels.cu`](../src/kernels.cu) now point to the newer implementation; use `git show ec066a7:src/main.cpp` and `git show ec066a7:src/kernels.cu` for the Part 6 snapshot. The “Attention” section of [`notes.md`](../notes.md) gives the working explanation. Start with [the Q/K/V projection notes](youtubePT5_qkv_projection_notes.md) if the three projected buffers are still unfamiliar.
+These notes describe the layer-0 attention implementation shown in [Part 6](https://youtu.be/tTULacSPXkc), before the later MLP and decode changes. The source links to [`src/main.cpp`](../../src/main.cpp) and [`src/kernels.cu`](../../src/kernels.cu) now point to the newer implementation; use `git show ec066a7:src/main.cpp` and `git show ec066a7:src/kernels.cu` for the Part 6 snapshot. The “Attention” section of [`notes.md`](../../notes.md) gives the working explanation. Start with [the Q/K/V projection notes](youtubePT5_qkv_projection_notes.md) if the three projected buffers are still unfamiliar.
 
 ## What we are finishing
 
@@ -98,7 +98,7 @@ The score tensor's storage grows as `32 × T × T`. At `T = 2048`, BF16 scores a
 
 ## Step 1: scaled Q·K scores with cuBLAS
 
-[`computeGqaAttentionScores`](../src/main.cpp) loops over all 32 query heads. For head `h`, it takes a pointer to that 64-value Q slice and a pointer to K head `h / 4`. The vectors are physically inside token-major rows: Q rows have stride `2048`, K rows have stride `512`. Passing `q + h * 64` or `k + (h/4) * 64` changes the **head offset**, but not the distance to the next token's row.
+[`computeGqaAttentionScores`](../../src/main.cpp) loops over all 32 query heads. For head `h`, it takes a pointer to that 64-value Q slice and a pointer to K head `h / 4`. The vectors are physically inside token-major rows: Q rows have stride `2048`, K rows have stride `512`. Passing `q + h * 64` or `k + (h/4) * 64` changes the **head offset**, but not the distance to the next token's row.
 
 For a query token `i` and key token `j`, the desired score is:
 
@@ -114,7 +114,7 @@ cuBLAS takes BF16 Q/K values, uses `CUBLAS_COMPUTE_32F`, then stores BF16 scores
 
 ## Step 2: make future positions impossible to use
 
-[`causalMaskKernel`](../src/kernels.cu) launches one thread per score element in flattened `[head, query, key]` storage. It recovers the two token indices with:
+[`causalMaskKernel`](../../src/kernels.cu) launches one thread per score element in flattened `[head, query, key]` storage. It recovers the two token indices with:
 
 ```cpp
 key_token = score_index % token_count;
@@ -127,7 +127,7 @@ The score matrix is not symmetric after masking. That is expected: the token at 
 
 ## Step 3: stable softmax, one row at a time
 
-[`stableSoftmaxKernel`](../src/kernels.cu) launches **one CUDA block per `(query head, query token)` row**, with 256 threads in that block. Every thread visits key positions `thread_index`, `thread_index + 256`, and so on. That stride lets the same kernel process a row longer than 256 keys.
+[`stableSoftmaxKernel`](../../src/kernels.cu) launches **one CUDA block per `(query head, query token)` row**, with 256 threads in that block. Every thread visits key positions `thread_index`, `thread_index + 256`, and so on. That stride lets the same kernel process a row longer than 256 keys.
 
 It makes two shared-memory reductions:
 
@@ -140,7 +140,7 @@ The reductions and exponentials use FP32. The probabilities are stored as BF16, 
 
 ## Step 4: use probabilities to mix V
 
-[`mixGqaValues`](../src/main.cpp) loops over 32 query heads. It selects that head's `[T, T]` probability matrix and its shared V head `h / 4`, then performs a cuBLAS matrix multiplication:
+[`mixGqaValues`](../../src/main.cpp) loops over 32 query heads. It selects that head's `[T, T]` probability matrix and its shared V head `h / 4`, then performs a cuBLAS matrix multiplication:
 
 ```text
 head_output_h [T, 64] = P_h [T, T] × V_(h/4) [T, 64]
@@ -158,13 +158,13 @@ token i output row = [head 0's 64 values | head 1's 64 values | ... | head 31's 
 
 ## Step 5: output projection and residual connection
 
-The concatenated head output is not yet the attention update in the model's hidden space. `prefill` calls the same [`projectBf16RowMajor`](../src/main.cpp) helper used for Q/K/V, this time with `weights.w_o[0]` and output width `2048`:
+The concatenated head output is not yet the attention update in the model's hidden space. `prefill` calls the same [`projectBf16RowMajor`](../../src/main.cpp) helper used for Q/K/V, this time with `weights.w_o[0]` and output width `2048`:
 
 ```text
 attention_update = attention_output × Woᵀ     [T, 2048]
 ```
 
-`W_o` is learned. It mixes features from the different heads and produces a vector with the same width as the incoming hidden state, so they can be added. The CUDA [`residualAddKernel`](../src/kernels.cu) gives one thread each hidden value, converts the two BF16 inputs to `float`, adds them, and writes BF16 back **in place**:
+`W_o` is learned. It mixes features from the different heads and produces a vector with the same width as the incoming hidden state, so they can be added. The CUDA [`residualAddKernel`](../../src/kernels.cu) gives one thread each hidden value, converts the two BF16 inputs to `float`, adds them, and writes BF16 back **in place**:
 
 ```text
 activations_gpu[token, feature] += output_projection_gpu[token, feature]

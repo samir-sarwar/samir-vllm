@@ -1,16 +1,18 @@
 # Building an Inference Engine — Notes
 
+Companion to [Part 1: Loading model weights](https://youtu.be/39_gWVbYgB4). This is the loading milestone: later videos add the forward pass, generation, batching, and paging. The current loader still targets this fixed Llama 3.2 1B layout; it does not infer a generic architecture from the checkpoint.
+
 ## SafeTensors
 
 There are different formats you can download models in, SafeTensors being one of the most popular.
 
 A safetensor file has 3 sections: **header size**, **JSON header**, **tensor data**. Quick aside: a tensor is a multi-dimensional array of numbers, and the tensor data here is the model weights.
 
-- **Header size** is always 8 bytes, unsigned 64-bit.
+- **Header size** is always 8 bytes, an unsigned 64-bit integer stored in little-endian order.
 - **JSON header** is just key-value pairs, where the key is a unique tensor name. Every value is itself a JSON with 3 keys:
   - `dtype` — what data type the tensor is stored in
   - `shape` — the dimensions of the tensor
-  - `offsets` — a start and end telling us where that tensor's raw numbers live in the data section
+  - `data_offsets` — a start and exclusive end telling us where that tensor's raw numbers live in the data section
 
 ## What we implement
 
@@ -47,7 +49,7 @@ That's pretty much the entire architecture for Llama 3.2 1B Instruct. What it gi
 
 For the dtype we can look the model up on HuggingFace: the weights are **BF16**.
 
-> **BF16** is a 16-bit floating point number. We use it because it's compact but still covers the full range of a 32-bit float. It splits into sign bit, exponent bits, and fraction bits. A 32-bit float and BF16 have the same number of exponent bits, so they cover the same range (-(2^8), 2^8 - 1) — i think that's right, I could be wrong. Where they differ is the fraction bits, so the tradeoff for the compact format is a bit of precision. For inference that's a good trade: a small precision loss for effectively halving memory use.
+> **BF16** is a 16-bit floating point number with 1 sign bit, 8 exponent bits, and 7 fraction bits. FP32 also has 8 exponent bits, so both cover a similar magnitude range, up to about `3.4 × 10^38`; this is not the range `-256` to `255`. FP32 has 23 fraction bits, so BF16 represents fewer distinct values within that range and rounds more coarsely. Storing weights in BF16 halves their memory use compared with FP32. The engine often converts values to FP32 for reductions and other arithmetic, then rounds the stored output back to BF16.
 
 ## Order of operations
 

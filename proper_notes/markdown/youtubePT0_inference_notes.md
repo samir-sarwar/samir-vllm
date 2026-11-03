@@ -17,7 +17,7 @@ text prompt
   -> choose next token ID -> tokenizer decode -> text
 ```
 
-The code now reaches the end of layer 0's self-attention sublayer: it loads weights, tokenizes a prompt, gathers embeddings, runs RMSNorm and Q/K/V projections, applies RoPE, computes masked attention, and adds the attention residual. It does not yet run the MLP, all 16 layers, or produce a next-token answer. When I describe the full path below, that's the model we're building toward, not a claim that `src/main.cpp` already runs it all.
+These notes introduce the whole model before the implementation videos build it piece by piece. The later Part 6 snapshot (`ec066a7`) stopped after layer 0's attention residual; [Part 7](youtubePT7_feed_forward_swiglu_mlp.md) completed all 16 layers and the first-token prediction. The current [`src/main.cpp`](../../src/main.cpp) also generates responses with a KV cache, batching, and paged decode attention. Read each companion note in the context of its video's milestone.
 
 ## Wtf is inference?
 
@@ -86,7 +86,7 @@ token IDs [T]
 
 `T` is the number of prompt tokens. `128256` is the vocabulary size, and `2048` is the hidden-vector width. Each decoder layer updates those hidden vectors. The operations are *not* interchangeable: RMSNorm, Q/K/V projections, RoPE, masked attention, residual additions, and the MLP must run in the model's intended order. [Part 1](youtubePT1_notes.md) has the architecture and weight names; [Part 2](youtubePT2_embedding_gather_notes.md) shows the first actual GPU operation.
 
-There is a subtle point about the last step. The model produces **logits**, which are scores, not already-selected words. Greedy decoding takes the largest logit with `argmax`; other sampling strategies may choose differently. This checkout has not connected that output path yet.
+There is a subtle point about the last step. The model produces **logits**, which are scores, not already-selected words. Greedy decoding takes the largest logit with `argmax`; other sampling strategies may choose differently. The shapes above show what the model could calculate at every prompt position. Our generation code applies the final norm and LM head only to the last prompt row, because that row predicts the first response token.
 
 ## Prompt processing and generating the next token
 
@@ -95,7 +95,7 @@ Two phases will matter later:
 - **Prefill**: run the whole prompt through the model, with causal attention, to establish hidden states and cache the K/V values for its positions.
 - **Decode**: append one new token and run enough work to predict the next one, reusing the prior K/V cache rather than recomputing the whole prompt each time.
 
-Why a **causal** mask? When predicting the next token, a position should only use tokens at that position or earlier. It must not peek into the future text. The current `prefill` function computes layer 0's attention for the prompt, but it does not yet retain K/V in a cache for later decode.
+Why a **causal** mask? When predicting the next token, a position should only use tokens at that position or earlier. It must not peek into the future text. [Part 8](youtubePT8_prefill_decode_kv_cache.md) explains how the completed prefill path retains each layer's K/V and how decode reuses them.
 
 ## The main distinction to remember
 

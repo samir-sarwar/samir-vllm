@@ -1,8 +1,8 @@
 # Part 7: Feed-Forward Network, SwiGLU, and the First Predicted Token
 
-These are companion notes for [the Part 7 video](https://youtu.be/HjllfB1IPrE). They develop the feed-forward section of [my working notes](../notes.md) into a code walkthrough. [Part 6](youtubePT6_self_attention_completion.md) finished self-attention; this part finishes each Llama layer, runs all 16 layers, and selects one next token. [Part 8](youtubePT8_prefill_decode_kv_cache.md) later adds cached, token-at-a-time generation.
+These are companion notes for [the Part 7 video](https://youtu.be/HjllfB1IPrE). They develop the feed-forward section of [my working notes](../../notes.md) into a code walkthrough. [Part 6](youtubePT6_self_attention_completion.md) finished self-attention; this part finishes each Llama layer, runs all 16 layers, and selects one next token. [Part 8](youtubePT8_prefill_decode_kv_cache.md) later adds cached, token-at-a-time generation.
 
-The code excerpts below use the **prompt prefill that predicts one next token**, shown in the video and committed as `e9399f9`. Some excerpts show the calls without their surrounding error checks so the data flow is easier to follow. The current [`src/main.cpp`](../src/main.cpp) also has the later Part 8 KV-cache and decode path. To see the complete video-era source rather than the later additions, run `git show e9399f9:src/main.cpp` and `git show e9399f9:src/kernels.cu`.
+The code excerpts below use the **prompt prefill that predicts one next token**, shown in the video and committed as `e9399f9`. Some excerpts show the calls without their surrounding error checks so the data flow is easier to follow. The current [`src/main.cpp`](../../src/main.cpp) also has the later KV-cache, decode, batching, and paging paths. To see the complete video-era source rather than the later additions, run `git show e9399f9:src/main.cpp` and `git show e9399f9:src/kernels.cu`.
 
 ## Where this work fits
 
@@ -22,7 +22,7 @@ The same sequence runs for every token position and then repeats with **differen
 
 ## Why have a feed-forward network after attention?
 
-An analogy from [my rough notes](../notes.md): imagine each token as a person holding a page of numbers. Attention is the round in which people can exchange information with permitted earlier people. The feed-forward network, or **FFN**, is the next round: each person applies the same kind of learned processing to *their own updated page*. The FFN does not perform another exchange between token positions.
+An analogy from [my rough notes](../../notes.md): imagine each token as a person holding a page of numbers. Attention is the round in which people can exchange information with permitted earlier people. The feed-forward network, or **FFN**, is the next round: each person applies the same kind of learned processing to *their own updated page*. The FFN does not perform another exchange between token positions.
 
 That does **not** mean the FFN's input has no context. Attention has already put context from earlier tokens into each updated hidden vector. The FFN processes those context-aware features one position at a time. In code, using one matrix multiplication for all prompt rows is a faster way to apply the same layer's weights independently to every row; it does not mix rows together.
 
@@ -88,7 +88,7 @@ SiLU is smooth, which helped make these weights trainable with gradients. The in
 
 ## Code: locate each layer's weights
 
-The loader keeps direct GPU pointers for every layer's MLP matrices. The following assignments appear in the model loader in [`src/main.cpp`](../src/main.cpp):
+The loader keeps direct GPU pointers for every layer's MLP matrices. The following assignments appear in the model loader in [`src/main.cpp`](../../src/main.cpp):
 
 ```cpp
 weights.mlp_gate_proj[layer] = reinterpret_cast<__nv_bfloat16 *>(
@@ -138,7 +138,7 @@ The output width is cuBLAS's `m`, the token count is `n`, and the input width is
 
 ## Code: one CUDA thread per SwiGLU value
 
-[`swiGluKernel`](../src/kernels.cu) implements the formula literally:
+[`swiGluKernel`](../../src/kernels.cu) implements the formula literally:
 
 ```cpp
 const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -240,7 +240,7 @@ token ID:    0     1     2     3     4
 logit:      0.4  -1.1   3.7   2.0  -0.3
 ```
 
-The largest **value** is `3.7`; its **index** is token ID `2`. Argmax returns `2`. For the real 128,256-entry logit vector, [`argmaxKernel`](../src/kernels.cu) launches one block of 256 threads. Each thread scans indices `threadIdx.x`, `threadIdx.x + 256`, and so on, keeping its best score and ID. The kernel then reduces the 256 candidates through shared memory:
+The largest **value** is `3.7`; its **index** is token ID `2`. Argmax returns `2`. For the real 128,256-entry logit vector, [`argmaxKernel`](../../src/kernels.cu) launches one block of 256 threads. Each thread scans indices `threadIdx.x`, `threadIdx.x + 256`, and so on, keeping its best score and ID. The kernel then reduces the 256 candidates through shared memory:
 
 ```cpp
 for (int index = thread; index < vocabulary_size; index += THREADS)

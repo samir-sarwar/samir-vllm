@@ -1,6 +1,8 @@
 # Rotary Position Embedding (RoPE) — Part 4 Video Notes
 
-Video: [RoPE explained and a kernel written from scratch](https://youtu.be/4gL0hd9UEAY). This follows [RMSNorm](youtubePT3_rmsnorm_notes.md). The implementation to keep open is [`initializeRopeTables`, `ropeKernel`, and `launchRope` in `src/kernels.cu`](../src/kernels.cu), plus [`prefill` in `src/main.cpp`](../src/main.cpp).
+Video: [RoPE explained and a kernel written from scratch](https://youtu.be/4gL0hd9UEAY). This follows [RMSNorm](youtubePT3_rmsnorm_notes.md). The implementation to keep open is [`initializeRopeTables`, `ropeKernel`, and `launchRope` in `src/kernels.cu`](../../src/kernels.cu), plus [`prefill` in `src/main.cpp`](../../src/main.cpp).
+
+The video milestone implements RoPE before connecting Q/K projections. The current source also applies the same kernel during decode, using each sequence's absolute position in the cache.
 
 ## What problem are we solving?
 
