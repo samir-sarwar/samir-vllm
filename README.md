@@ -8,7 +8,7 @@ The series follows what happens between a prompt and a generated token, from loa
 
 Read [Inference from Scratch (PDF)](InferenceFromScratch.pdf) for 80+ pages of my handwritten notes and diagrams. I developed all of the writing in this PDF myself, with **NO AI writing**.
 
-## Build series
+## Build series | 6+ Hours of footage
 
 <table width="100%">
 <tr>
