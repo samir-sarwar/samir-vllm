@@ -4,6 +4,10 @@
 
 The series follows what happens between a prompt and a generated token, from loading model weights to running each part of the transformer on the GPU.
 
+## My inference notes
+
+Read [Inference from Scratch (PDF)](InferenceFromScratch.pdf) for 80+ pages of my handwritten notes and diagrams. I developed all of the writing in this PDF myself, with **NO AI writing**.
+
 ## Build series
 
 <table width="100%">
