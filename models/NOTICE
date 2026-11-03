@@ -1,0 +1,14 @@
+Built with Llama
+
+The bundled models/Llama-3.2-1B-Instruct/original/tokenizer.model is a
+Llama 3.2 model asset supplied by Meta. Llama model weights and tokenizer
+assets retain Meta's terms and are excluded from the project's MIT License.
+
+Llama 3.2 is licensed under the Llama 3.2 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved.
+
+See LICENSE-LLAMA-3.2 and USE_POLICY.md in this directory. Keep these files
+with the tokenizer or any other Llama 3.2 materials when redistributing them.
+
+Upstream sources:
+https://github.com/meta-llama/llama-models/blob/main/models/llama3_2/LICENSE
+https://github.com/meta-llama/llama-models/blob/main/models/llama3_2/USE_POLICY.md

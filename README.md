@@ -103,3 +103,17 @@ python/        Tokenizer reference script
 proper_notes/  Notes for the video series
 notes.md       Working notes from the build
 ```
+
+## License
+
+The engine source code in `src/`, `include/`, `tests/`, and `python/`, along with `CMakeLists.txt`, `.gitignore`, and this README, is licensed under the [MIT License](LICENSE).
+
+The notes in `proper_notes/`, `notes.md`, and `podLibraryInstall.md`, along with handwritten notes, scans, illustrations, photographs of notes, and PDFs provided with this project, are **all rights reserved** and excluded from MIT. Personal reading and study are permitted. Redistribution, republication, rehosting, resale, or distribution of adapted versions requires prior written permission, whether offered for free or for payment. See [LICENSE-NOTES](LICENSE-NOTES) for the full terms and exceptions.
+
+Public repositories can still be viewed and forked within GitHub under [GitHub's Terms of Service](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#5-license-grant-to-other-users).
+
+### Model assets and dependencies
+
+**Built with Llama.** The bundled Llama 3.2 tokenizer and any separately downloaded Llama 3.2 weights retain Meta's [Llama 3.2 Community License](models/LICENSE-LLAMA-3.2) and [Acceptable Use Policy](models/USE_POLICY.md). They are excluded from MIT. Keep the agreement, policy, and [attribution notice](models/NOTICE) with any redistributed Llama materials.
+
+Third-party dependencies, including CUDA, cuBLAS, ICU, and `nlohmann/json`, retain their respective licenses.

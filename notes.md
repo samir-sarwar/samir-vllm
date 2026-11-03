@@ -1,3 +1,5 @@
+> Copyright (c) 2026 Samir Sarwar. All rights reserved. Personal reading and study are permitted; redistribution requires prior written permission, subject to [LICENSE-NOTES](LICENSE-NOTES).
+
 What am i doing:
 Building an LLM inference engine with C++ and CUDA similar to a much smaller version of VLLM. VLLM is an open source LLM inference engine which supports many models.
 
