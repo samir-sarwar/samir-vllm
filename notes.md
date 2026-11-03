@@ -1,19 +1,56 @@
 > Copyright (c) 2026 Samir Sarwar. All rights reserved. Personal reading and study are permitted; redistribution requires prior written permission, subject to [LICENSE-NOTES](LICENSE-NOTES).
 
+Learn LLM Inference from Scratch by building a small vLLM by hand using C++ and CUDA.
+
+Copyright (c) 2026 Samir Sarwar. All rights reserved. Personal reading and study are permitted; redistribution requires prior written permission.
+Table of Contents
+Preface: 2
+What am i doing: 2
+Wtf is inference?: 2
+Chef Anlogy: 3
+Why C++ and CUDA: 4
+SafeTensors: 4
+What we implement: 5
+An aside on memory: 10
+Loading the Model: 10
+Tokenization 14
+Normilization using RMSNorm: 16
+Understanding the code: 18
+RoPE (Rotary Positional Embedding/Encoding): 21
+Attention: 29
+Single Headed Attention: 29
+Multi-headed Attention: 33
+Grouped Query Attention: 35
+Feed Forward Network: 36
+Decode: 48
+Prefill vs.Decode: 48
+Why cache?: 50
+Batching: 61
+Latency and Throughput: 61
+Buffer reuse: 63
+Decode step walkthrough: 66
+Static Batching: 70
+Continuous Batching: 72
+Req identity 73
+Finished req slots: 74
+Memory: 77
+Paged KV Cache & Attention 79
+Conclusion: 86
+Preface:
+If you’ve made it here, welcome! Below you’ll find 80+ pages of handtyped notes on the basics of LLM inference from the ground up for complete beginners. It is quite informal, more similar to a friend explaining a concept to you rather than a textbook. All text below was written by me, NO AI GENERATION so I hope that you can enjoy the fruits of my labour. There are accompanying videos that go along with these notes as part of a youtube video series building out the entire inference engine from scratch if you're more interested in the coding side. If you do want more structured textbook style notes, those are also available in the github repo, though those are AI generated based off my videos and notes. Yes there are typos, and short-formed versions of words I apologize :( .
 What am i doing:
 Building an LLM inference engine with C++ and CUDA similar to a much smaller version of VLLM. VLLM is an open source LLM inference engine which supports many models.
 
 Wtf is inference?:
-Well from my searching the most simple answer to this is that AI inference is when a model provides an answer based on data.
+Well the most simple answer to this is that AI inference is when a model provides an answer based on data.
 
 Where a model is practically a file with weights that are represented as floating point numbers, with operations/functions that are using these weights. Operations are functions that take data as input and output some other data, but more specifically it's the mathematical steps a model performs like matrix math.
--> It’s obviously deeper than this with embeddings and predicting highest scoring token but from my understanding this can be abstracted when looking at inference
 
 An LLM is a Model. One with billions of weights that let it predict the next word or token in text.
 
 Weights are learned during training, and that includes post-training as well, like instruction tuning where we’re still updating the weights to change how the model responds. Once we take that resulting checkpoint and use it for inference we keep the weights fixed, so the numbers changing with each input are the hidden states and other results we calculate, we aren’t training the model again every time someone asks it something.
 
-So it seems what we’re getting at here is that inference handles how we USE the model, so during training the model learns itself and discovers its weights and now that we have that, inference uses that model on a specific input to produce a prediction
+So what we’re getting at here is that inference handles how we USE the model, so during training the model learns itself and discovers its weights and now that we have that, inference uses that model on a specific input to produce a prediction
 
 Where an inference engine is the software that performs the process above efficiently. So putting the input through the math, using GPU, managing memory, and getting result
 
@@ -68,17 +105,17 @@ LlamaForCausalLM(
 
 This is pretty much the entire model architecture for Llama 3.2 1B instruct. What does that mean? Pretty much just outlines the different operations we need to run, as well as the data shapes and types that we need to use.
 
-From this we don’t actually know the order of operations or data type, it’s just an object with code that I don't really understand yet. We can search up the model on huggingface and we can find out that the dtype for the model weights are BF16
+So this gives us the model’s components and dimensions, but we still need to know the order we run them in and what data type the weights use. We can search up the model on huggingface and we can find out that the dtype for the model weights are BF16
 -> BF16 is a 16 bit floating point number, we use it because its a compact format that allows us to still access the full range of a 32 bit float, it is separated into 1 sign bit, 8 exponent bits, and 7 fraction bits, both a 32 bit float and 16 bit float have the same number of exponent bits but fp32 has more fraction bits (23).Meaning pretty much that the tradeoff of using this more compact format is a bit of precision. For inference this is a positive tradeoff, this small loss of precision is worth the benefit from effectively halving memory use.
 
 Like I think I mentioned before, we need to know the order of operations to effectively produce correct output from the model, as the operations are different computations in certain order to produce a certain output.
 
 For this we need to search up the LLM architecture, diagrams are good and Sebastian Raschka has a bunch of them here or just search it up.
-Lets figure out how I’m supposed to dissect this diagram though.
+So lets go through the diagram and see what actually happens to the input..
 
 Figure 1: Llama 3.2 1B Architecture Diagram [Sebastian Raschka]
 
-So we can see that we start off by sending some input text to the model. We then turn them into tokens, we do this using a Tokenizer , this converts text into pieces the model recognizes. So in this phase the tokenizer takes our input and splits the sentence or phrase into smaller pieces, which could be whole words, pieces of words, punctuation, etc. Then it assigns IDs to these specific pieces, it does this because it created a fixed list of token pieces during its training, each mapping to an ID, the ID value itself is arbitrary. You might think, okay well what if it wasnt trained on a certain input, well like i mentioned before then the tokenizer would break it down as much as possible (split ex.: [“hyperglob”] -> [“hyper”, “gl”, “ob”]) until it resembles something part of the tokenizers vocabulary. Then we hit up the embedding table, which contains one learned starting vector for every token ID, and the ID we got from the previous step tells us which row to grab. The other model weights, like the Q/K/V and FFN matrices, are separate tensors (embed_tokens): Embedding(128256, 2048) This is the code that tells us that there are 128,256 possible token IDs and 2048 learned weights, which form an Embedding Vector . That pink box, is called a transformer block also called layers, there are 16 of them that have a shit ton of operations that I don’t know yet but will get a clear understanding as I build more of the engine. They consist of these computations:
+So we can see that we start off by sending some input text to the model. We then turn them into tokens, we do this using a Tokenizer , this converts text into pieces the model recognizes. So in this phase the tokenizer takes our input and splits the sentence or phrase into smaller pieces, which could be whole words, pieces of words, punctuation, etc. Then it assigns IDs to these specific pieces, it does this because it created a fixed list of token pieces during its training, each mapping to an ID, the ID value itself is arbitrary. You might think, okay well what if it wasnt trained on a certain input, well like i mentioned before then the tokenizer would break it down as much as possible (split ex.: [“hyperglob”] -> [“hyper”, “gl”, “ob”]) until it resembles something part of the tokenizers vocabulary. Then we hit up the embedding table, which contains one learned starting vector for every token ID, and the ID we got from the previous step tells us which row to grab. The other model weights, like the Q/K/V and FFN matrices, are separate tensors (embed_tokens): Embedding(128256, 2048) This is the code that tells us that there are 128,256 possible token IDs and 2048 learned weights, which form an Embedding Vector . That pink box, is called a transformer block also called layers, there are 16 of them that have a shit ton of operations that you might not know yet but will get a clear understanding as we build more of the engine. They consist of these computations:
 RMS Norm
 Residual connection
 Masked grouped-query attention, which consists of:
@@ -108,7 +145,7 @@ Data can live in host or device. Host would be the actual PC using the CPU, it h
 Loading the Model:
 It’s time to start work and the first step when working with inference is to actually load the model you’re working with. Remember how we talked about copying the weights from CPU RAM into GPU VRAM so the GPU can keep reading them efficiently, thats effectively what we’re doing now, VRAM isnt necessarily bigger than CPU RAM, it’s memory attached to the GPU and is a form of DRAM as well. Remember how before we said that a model is actually a single file with weights, thats pretty much what we’re reading now, a model.safetensors file. Remember before that A safetensor file is made of 3 sections, header size, JSON header, tensor data. Where tensor data is actually many tensors. So we have to read from safetensors file, to do this remember in C how we had to create actually open a file using fopen or open(), its the same thing in C++ but now we use std::ifstream, meaning input file stream which creates an object that lets cpp program read data from the file. We also have to use ios::binary to say the file is raw binary data so it preserves every byte exactly as if we dont sometimes the compiler tries to optimize or translate special chars or line endings while reading which would corrupt bytes and make offsets wrong.
 
-It’s been a minute since I updated my notes but I was pretty much just learning as I coded through loading the model. So it seems we left off on learning to open files using ifstream. Once we open the model file, we do in fact need to read it as well. As we’ve already mentioned numerous times, the file is a safetensor file. Which is formatted by the header, the JSON header which includes pretty much meta data on every single tensor in the model. There are 16 transformer layers, each of which have 9 different tensors inside of them. These 9 different tensors occupy some space in that file, these are recorded by their offsets, which can be found in the JSON header. This is important because at some point we’re going to have to use these model weight values and we can’t keep reading from the file. Super slow! We have to bring it to the GPU memory (VRAM) So how? Now we’ve opened the file which is the first step, but we also have to read it. Why? Because that can tell us a bit more about how we should be specifically parsing this. As I mentioned before each of the tensors are multidimensional arrays of floating point values that are weights for us. Each having a unique name as their key that defines what the tensor is actually for. Meaning if later on we need to find these tensors knowing the naming convention allows us to be able to quickly find what we’re looking for. We’ll get into that a bit more later, but thats just a preface on the motivation behind reading and moreso printing what we find from reading the JSON header that describes each tensor. So how do we read? Well first we have to read the original header, a safetensor file starts with the header size as a uint64_t meaning 8 byte value to tell us how large what we’re reading next is going to be. Then we call .read(destination, bytes to read) on the safetensor file that we opened. It will return to us the value of the first 8 bytes as we had set it that way. Now we know how big the json header is so we can read it to completion. Now that we know we can use the .read again but now for the next headersize amount of bytes. One thing to mention, we are calling read again on our safetensor file, meaning the file pointer is currently at the start of the json header anyways, i.e 8 bytes in so we don’t have to handle for that. But what do we read to, read needs a destination buffer, of type char, an array of chars, which is a string. So we make a string of size headersize, initializing it to \0. Then we read headersize amount of bytes to it. Great! Now we have the JSON header, and we can parse it for the offsets that we will need for 2 things. 1) The max offset will tell us how much space the tensordata takes up, as remember we know how big the header is but not the raw tensor data i.e the weights. 2) It would allow us to read the starting offsets, which we need later to create pointers to them, as we will be allocating all this memory to the gpu, and we want pointers on our cpu memory so we can quickly access the gpu memory. Okay, so how do we go about parsing?
+Once we open the model file, we do in fact need to read it as well. As we’ve already mentioned numerous times, the file is a safetensor file. Which is formatted by the header, the JSON header which includes pretty much meta data on every single tensor in the model. There are 16 transformer layers, each of which have 9 different tensors inside of them. These 9 different tensors occupy some space in that file, these are recorded by their offsets, which can be found in the JSON header. This is important because at some point we’re going to have to use these model weight values and we can’t keep reading from the file. Super slow! We have to bring it to the GPU memory (VRAM) So how? Now we’ve opened the file which is the first step, but we also have to read it. Why? Because that can tell us a bit more about how we should be specifically parsing this. As I mentioned before each of the tensors are multidimensional arrays of floating point values that are weights for us. Each having a unique name as their key that defines what the tensor is actually for. Meaning if later on we need to find these tensors knowing the naming convention allows us to be able to quickly find what we’re looking for. We’ll get into that a bit more later, but thats just a preface on the motivation behind reading and moreso printing what we find from reading the JSON header that describes each tensor. So how do we read? Well first we have to read the original header, a safetensor file starts with the header size as a uint64_t meaning 8 byte value to tell us how large what we’re reading next is going to be. Then we call .read(destination, bytes to read) on the safetensor file that we opened. It will return to us the value of the first 8 bytes as we had set it that way. Now we know how big the json header is so we can read it to completion. Now that we know we can use the .read again but now for the next headersize amount of bytes. One thing to mention, we are calling read again on our safetensor file, meaning the file pointer is currently at the start of the json header anyways, i.e 8 bytes in so we don’t have to handle for that. But what do we read to, read needs a destination buffer, of type char, an array of chars, which is a string. So we make a string of size headersize, initializing it to \0. Then we read headersize amount of bytes to it. Great! Now we have the JSON header, and we can parse it for the offsets that we will need for 2 things. 1) The max offset will tell us how much space the tensordata takes up, as remember we know how big the header is but not the raw tensor data i.e the weights. 2) It would allow us to read the starting offsets, which we need later to create pointers to them, as we will be allocating all this memory to the gpu, and we want pointers on our cpu memory so we can quickly access the gpu memory. Okay, so how do we go about parsing?
 The way we go about parsing is: we’ve already created a string which has our JSON header in it. We use the JSON library that we imported before to convert our string, header, into a JSON object. We do that using the json::parse function.
 As I mentioned before, we need to remember the starting offset so we can create our pointers later. The way we can go about that is using a hashmap, which in C++ is an unordered_map. The key-value type would be a string for the key, and a uint64_t for the value.
 We also initialize our max_offset at zero because we will continuously check that throughout each iteration of a for loop that goes through the items of the header, which is now a JSON object.
@@ -133,6 +170,7 @@ It then starts checking which byte combinations exist in the tokenizer vocabular
 One thing to note, as you’ll see we are using an instruct model, but what does that mean? It just means our actual prompt also has a chat format around the words we typed. So our tokenizer adds the beginning-of-text token, a user header, the message and end-of-turn token, then starts an assistant header so the model knows whose text to continue. These are extra token IDs that go through the engine too and take up context positions just like the message tokens.
 Anyways so the final result is just a list of integers, something like [128000, 9906, 1917]. The tokenizer does not actually do any neural network calculations itself; it is really just translating text into the integer IDs that the trained Llama model understands.
 Then our C++ inference engine takes those IDs and copies them to the GPU. From there, the embedding lookup uses each ID to grab the correct row from the embedding table in our safetensors weights. Those embedding vectors become the starting hidden states that go through all of the Transformer layers.
+
 At the end, the model gives us a new token ID that it thinks should come next. We then use the tokenizer in reverse, where it looks up that ID in the vocabulary and turns its stored bytes back into readable text.
 
 input text
@@ -140,7 +178,7 @@ input text
 → next token ID → tokenizer decode → output text
 
 Normilization using RMSNorm:
-As we saw from the diagram above (Figure 1) the next phase of our inference engine is for our tokens to go through RMSNorm1 which seems to mean the first Root Mean Square normilization, furthermore it seems to be happening inside of a Transformer layer, meaning its a repeated calculation for each layer. What is it/ Why do we do it, so firstly the mathematical operation of RMS Normilization is pretty much just dividing the vector by its root mean square, meaning before the learned scale its RMS comes out close to 1, the ordinary average doesnt have to be 1 and individual values can still be negative or much bigger than 1. In our model the full calculation is
+As we saw from the diagram above (Figure 1) the next phase of our inference engine is for our tokens to go through RMSNorm1 which means the first Root Mean Square normilization, furthermore it’s happening inside of a Transformer layer, meaning its a repeated calculation for each layer. What is it/ Why do we do it, so firstly the mathematical operation of RMS Normilization is pretty much just dividing the vector by its root mean square, meaning before the learned scale its RMS comes out close to 1, the ordinary average doesnt have to be 1 and individual values can still be negative or much bigger than 1. In our model the full calculation is
 y[i] = x[i] / sqrt(mean(x²) + 1e-5) \* gamma[i]
 where gamma is a learned weight for each of the 2048 coordinates, so that final multiplication can change the direction too, and dividing by the RMS can make a small vector bigger just as it can make a big one smaller. Why do we do this, and doesn’t this affect our weights? As I mentioned earlier, how we look at the vectors from the embedding table is that their semantic value is embedded in its direction. A practical example would be if say the word woman, man, brother, and sister each had its own token ID in our vocabulary. If you were to take brother, subtract the man vector, then add the woman vector, the vector would point in the direction of sister. All this while saying the actual magnitude didn’t matter, just the direction. So if we were to normalize this, meaning the relation between the values in the vector would be the same but their actual magnitude would be less. The actual calculation is very simple. We just take each value in the vector, square it, then get the average, then get the square root of this average. Lastly divide each value in the vector by by the RMS value.
 Ex. [1,2,3,4,5] -> [1,4,9,16,25] -> μ = 11 -> = 3.316
@@ -150,12 +188,14 @@ We went over how it works, why it works, but why do we do it? Well as the hidden
 Understanding the code:
 RMSNorm treats each token IDs 2048-value hidden vector (vector that comes initially from the embedding table, These are called hidden values because they are the model’s internal representation rather than directly interpretable outputs. ) independently. Before we do anything, as we did when loading the model. Computations are to be done on the GPU so we have to allocate and copy over the actual vector of token IDs to the GPU using cudaMalloc and cudaMemCpy. Then we are going to have to deal with a table of all the token IDs and their respective hidden values, as afterall these are the weights we are going to be working with. And so you allocate space on the GPU for that too, you dont re-create it on cpu to copy on to the GPU though, as if you remember correctly our preliminary work to put all the weights on the GPU as well as create a pointer directly to the embedding table was already done, no need to duplicate efforts. Now we’re going to be writing a CUDA kernel, which is pretty much just a way of saying a function that will run on the GPU. But instead of running just once, the GPU is going to take this exact same function and run it thousands of times simultaneously across all of its cores. Taking complete advantage of parallelism. **global** declares a CUDA kernel. It runs on the GPU and is launched by CPU code using <<<blocks, threads>>>. Passed into our kernel is a ptr to the input tensor with token_count rows, and 2048 columns. As well as an identically sized output tensor for normalized values. Lastly a weight vector containing 2048 weights, each token uses same weight vector. In this kernel, we face an interesting parallelism problem, where the threads actually have to communicate with each other. In this case its due to the fact that you require a total sum for one of the steps of the computation of RMSNormilzation vector. One thing about CUDA kernels is that you can only at once spawn 1024 threads in a block, this is important as we can only safely share partial sums amongst threads within the same block. Meaning 2 blocks won’t work so the solution would be to have each thread handle two of the token’s 2048 hidden values and stores their squared sum in its spot.
 Ex: partial[tid] = x0 _ x0 + x1 _ x1;
+
 Which brings us to **shared** which pretty much just means shared memory, that any of the threads in the block can read/write to. It is in float instead of bf16 as here with all these computations we want to assure as much precision as possible before its lost later on, if we compute using bf16 now it’d be farther away from the true value. One block handles one token. It stores each threads partial sum. The example illustrated above is not necessarily how we take the value though. We do it by taking it from the first half squaring it, and adding from the second half squaring it and putting that value in the partial sum vector. So it’d be 1024 away from base + tid. hen we use \_\_syncthreads(), which is a barrier for the threads in this block, so each thread waits until the others reach that point as well before continuing. This means we can now read the partial sums knowing the other threads have finished writing them, the threads keep running afterwards, unlike pthread_join() which you may be familiar with which waits for a thread to finish completely. We want to find the total sum of these squared values so we can calculate the RMS, and adding them one by one would take more sequential steps than we need. So we use a tree reduction, like instead of one person adding a list of 8 numbers with 7 additions in a row, multiple threads add pairs at the same time, then add the results in pairs again until one total remains.
 Ex:
 Step 1: 4 processors add 4 pairs of numbers at the same time. (You are left with 4 results).
 Step 2: 2 processors add those 4 results in pairs. (You are left with 2 results).
 Step 3: 1 processor adds the final pair to get the total.
 The Result: It only took 3 steps instead of 7.
+
 In our case we would have 512 → 256 → 128 → 64 → 32 → 16 → 8 → 4 → 2 → 1. So in the first round we’d have:
 partial[0] += partial[512]
 partial[1] += partial[513]
@@ -185,42 +225,32 @@ Q_A = [ 2 ]
 Assume the key for token B is:
 K_B = [ 3 ]
 [ 4 ]
-Let their positions be:
-p_A = 2, p_B = 5
-And, just for this example, let this pair’s RoPE frequency be:
-ω = 0.1
+Let their positions be: p_A = 2, p_B = 5
+And, just for this example, let this pair’s RoPE frequency be: ω = 0.1
+In reality we use the frequency formula we see in the code for each pair, RoPE calculates one angle per token:
 
-In reality we use the frequency formula we see in the code for each pair,
-RoPE calculates one angle per token:
 θ_A = p_A × ω = 2 × 0.1 = 0.2
 θ_B = p_B × ω = 5 × 0.1 = 0.5
 Now rotate the query:
 Q'\_A = [ 2·cos(0.2) - 1·sin(0.2) ]
 [ 2·sin(0.2) + 1·cos(0.2) ]
-Using:
-cos(0.2) ≈ 0.9801, sin(0.2) ≈ 0.1987
-we get:
+Using: cos(0.2) ≈ 0.9801, sin(0.2) ≈ 0.1987 , we get:
 Q'\_A = [ 2(0.9801) - 1(0.1987) ] = [ 1.7615 ]
 [ 2(0.1987) + 1(0.9801) ] [ 1.3774 ]
 Now rotate the key:
 K'\_B = [ 3·cos(0.5) - 4·sin(0.5) ]
 [ 3·sin(0.5) + 4·cos(0.5) ]
-Using:
-cos(0.5) ≈ 0.8776, sin(0.5) ≈ 0.4794
-we get:
+Using: cos(0.5) ≈ 0.8776, sin(0.5) ≈ 0.4794, we get:
 K'\_B = [ 3(0.8776) - 4(0.4794) ] = [ 0.7150 ]
 [ 3(0.4794) + 4(0.8776) ] [ 4.9486 ]
 Attention now compares the rotated query and key with a dot product:
 Q'\_A · K'\_B = (1.7615)(0.7150) + (1.3774)(4.9486) ≈ 8.075
-That 8.075 is this pair’s contribution to the attention score.
-The important part is that token A was rotated by 0.2 radians and token B by 0.5 radians. Their difference is:
+That 8.075 is this pair’s contribution to the attention score. The important part is that token A was rotated by 0.2 radians and token B by 0.5 radians. Their difference is:
 θ_B - θ_A = 0.5 - 0.2 = 0.3
-which is also:
-(p_B - p_A)ω = (5 - 2)(0.1) = 0.3
+which is also: (p_B - p_A)ω = (5 - 2)(0.1) = 0.3
 So the comparison naturally contains their relative distance:
 p_B - p_A = 3
 In a real head, this happens for all 32 RoPE pairs, and the attention dot product adds all of their contributions together.
-
 So to put it simply all we’re doing is rotating each weight in our query and key vectors for each of our tokens, they rotated based on which token position they have in the prompt, and then finally as you may be thinking dont we need to get the relation between all of them, yes we do that when we finally compute the dot product and the final attention scores go into its respective matrix, happens during attention.
 
 How it works for each of the rotations within the vector, query OR key itself is as such:
@@ -244,7 +274,6 @@ Q'3
 The same happens to its key vector:
 
 K3K'3
-
 Only after every token has its own rotated Q and K does attention compare tokens:
 Q'3K'1
 
@@ -277,7 +306,6 @@ Pair 1 rotates only a little because its frequency is slower:
 (5,7) → [ 5·cos(0.03) - 7·sin(0.03) ] ≈ [ 4.788 ]
 [ 5·sin(0.03) + 7·cos(0.03) ] [ 7.147 ]
 So the rotated query for token 3 becomes approximately:
-
 Q'3=[1.024, 4.788, 3.457, 7.147]
 Same token position; different pair frequencies; different rotation amounts.
 In the real model, this happens for all 32 pairs in a head.
@@ -285,12 +313,11 @@ In the real model, this happens for all 32 pairs in a head.
 Remember though this is how the frequencies are actually calculated:
 
 i=12i/d
-
 =500000
 
 d=64
 
-Theta and d values coming from how LLama is.
+Theta and d values coming from the LLama model configuration.
 
 Last thing to note, is that in LLama we also scale the frequencies with pairs, why and how we do this noted below:
 
@@ -301,10 +328,9 @@ A pair’s wavelength is the number of token positions needed for one full rotat
 
 i=2i
 Therefore:
+large ishort wavelengthfast rotation
 
-largeishortwavelengthfastrotation
-
-smallilongwavelengthslowrotation
+small ilong wavelengthslow rotation
 Llama divides RoPE pairs into three wavelength regions:
 
 i<2048
@@ -331,7 +357,7 @@ This stretches its wavelength:
 Why: fast pairs retain precise local position information, while stretched slow pairs remain useful across much longer contexts.
 Attention:
 Single Headed Attention:
-So this is the big kicker, and what you’ve probably heard a million times, especially on the famous paper ‘Attention is all you Need’ that really kickstarted the whole AI boom. In our engine we use Multi-headed attention but its good to start here to get a foundation. We may have jumped the gun a bit by talking about RoPE before really understanding attention, so I may change up the order of where this is in the notes.
+So this is the big kicker, and what you’ve probably heard a million times, especially on the famous paper ‘Attention is all you Need’ that really kickstarted the whole AI boom. In our engine we use Multi-headed attention but its good to start here to get a foundation.
 
 Pretty much though, attention lets a token use information from other token positions to build up context. A good example could be ‘I just clean windows’ and ‘I just downloaded windows’, for us humans the words clean and downloaded make it pretty easy to tell which windows we mean. If we took each token’s starting embedding and passed it through a feed forward network independently, then windows would start with the same representation in both cases and wouldnt have access to those surrounding words, so that independent processing wouldnt give it the context we need. A feed forward network can use context if we actually supply it in the input, but here attention is the operation that mixes information between positions, meaning the representation for windows can change based on the words around it, but how?
 
@@ -348,6 +374,7 @@ Perfect, now you can think of their attention scores as being the dot product of
 S = QKT + M  
 Where d_k is the number of values in one key head, so we divide the dot products by sqrt(d_k) to control how spread out the scores get as that dimension grows. We then add M, which is 0 for positions the query can attend to and -∞ for future positions, because we dont want a token looking ahead. The dot products can be negative as well, thats fine though because they’re scores and we care about how each one compares to the others. Softmax runs across the key positions separately for each query, we subtract that row’s maximum for numerical stability, take the exponentials and divide by their sum, so the resulting attention weights add to 1 and future positions get weight 0. Thus we are given the attention-weight matrix:
 A = softmax(QKTdk + Mask)
+
 The attention-weight matrix tells us where each token should look, but it doesn’t yet tell us what information to take from those tokens. That is the purpose of the value vectors. Each value vector is created from the token’s current representation using its own learned matrix:
 V = X × Wvᵀ, you can think of values as the actual information that token can provide. Q and K determine the attention weights; V contains the information we transfer once we know which tokens matter.
 We therefore multiply the attention-weight matrix by the value matrix:
@@ -367,6 +394,7 @@ For our Llama 3.2 1B model, the query projection has 2,048 values per token. We 
 So, after the Q projection, we can think of it as:
 Q = [Q₀, Q₁, Q₂, ..., Q₃₁]
 where every Qₕ is a smaller query matrix with shape: [# of tokens, 64].
+
 The same idea then also applies to keys and values. Each head runs the exact single-head attention calculation independently:
 Sₕ = (Qₕ × Kₕᵀ) / √64 + M
 Aₕ = softmax(Sₕ)
@@ -391,13 +419,15 @@ Q heads 4–7 use K,V head 1
 ...
 Q heads 28–31 use K,V head 7
 
+Here the picture uses groups of 2 query heads, our Llama model uses groups of 4.
+Source: Sebastian Raschka
 So now our actual calculation for each query head h would be:
 
 kv_head = h / 4
-
 Sₕ = (Qₕ × K_kv_headᵀ) / √64 + M
 Aₕ = softmax(Sₕ)
 head_outputₕ = Aₕ × V_kv_head
+
 The reason we do this is that it keeps the multiple query perspectives that make multi-head attention so powerful, while using fewer key and value vectors. This saves a ton of KV-cache memory during inference. We’ll get into why that’s so important later on ;)
 
 Feed Forward Network:
@@ -764,7 +794,7 @@ Batching:
 Latency and Throughput:
 So now we’re kinda done no? I mean we’ve gone through all of prefill including writing the whole attention and feed forward networks, across all layers, generated a token and did it repeatedly through decode with the help of the KV cache, meaning effectively it can generate answers, so whats next?
 
-We now want it to be able to serve several users efficiently, the classic software problem of scaling. At the moment its relatively useless considering everythings local, but when we get into turning this into a callable api that we can expose to a frontend and mess with, this becomes a big problem that we should be able to solve.
+We now want it to be able to serve several users efficiently, the classic software problem of scaling. If we expose this through an API that a frontend can call, we need to handle multiple requests efficiently as well, so this is where batching comes in.
 
 How we do so, is the fundamental software problem of parallelism/concurrency as we’ve seen so many times at this point. To understand the basics if you are not familiar, two important terms to understand are latency and throughput, lets imagine 3 requests, A,B, and C. If each req takes 5 seconds, then processing them sequentially would mean
 A gets its answer after 5 seconds.
@@ -821,6 +851,7 @@ Computing the matrix multiplication:
 A’s output: [1×2 + 2×1, 1×0 + 2×3] = [4, 6]
 B’s output: [3×2 + 4×1, 3×0 + 4×3] = [10, 12]
 Each row uses its own input values and the same learned weights. This multiplication never combines A’s input with B’s input.
+
 Even though we could calculate those two rows through separate matrix multiplications and get the same mathematical results, combining them gives the GPU more work to perform together and it can spread launch overhead across more rows and reuse weight values while calculating those rows, which can improve overall throughput.
 Decode step walkthrough:
 This next part is definitely a bit more on the verbose side, as it goes through a whole batched decode so you can probably skip, though if you’re having a hard time understanding I do recommend you take a look at this.
@@ -899,16 +930,18 @@ Slot 1: B B B B B B
 Waiting: C C C C C C
 
 - means the slot is empty
-  As you can see theres evidently a problem in that when response lengths vary, for example a yes or no vs writing an essay the first request finishes way before the second one so a third request has to wait pretty unnecessarily.
-  Continuous Batching:
-  With continuous batching, we check for available slots between decode rounds and fill them from the waiting queue.
-  So going back to our example, Req A still finishes after step 2, but now we admit C into its freed slot before the next decode round, pretty much a better version of what we were doing before with static batching. Diagramatically as so:
-  Decode round: 1 2 3 4 5 6
-  Slot 0: A A C C C C ...
-  Slot 1: B B B B B B
-  ↑
-  C has joined the batch
-  C continues for however many steps it needs while B keeps its existing slot and KV history, so when C joins, we process C’s current token alongside B’s current token. This means batch membership changes during generation and where the extra logic behind developing continuous batching comes into play.
+
+As you can see theres evidently a problem in that when response lengths vary, for example a yes or no vs writing an essay the first request finishes way before the second one so a third request has to wait pretty unnecessarily.
+Continuous Batching:
+With continuous batching, we check for available slots between decode rounds and fill them from the waiting queue.
+So going back to our example, Req A still finishes after step 2, but now we admit C into its freed slot before the next decode round, pretty much a better version of what we were doing before with static batching. Diagramatically as so:
+Decode round: 1 2 3 4 5 6
+Slot 0: A A C C C C ...
+Slot 1: B B B B B B
+↑
+C has joined the batch
+
+C continues for however many steps it needs while B keeps its existing slot and KV history, so when C joins, we process C’s current token alongside B’s current token. This means batch membership changes during generation and where the extra logic behind developing continuous batching comes into play.
 
 We must develop a scheduler, which is the code that manages batch membership during decode. The scheduler, in between decode steps repeatedly does the following actions:
 Admit waiting requests into available slots, running prefill for each new request.
@@ -1020,7 +1053,7 @@ Decode C and B
 B keeps its KV history during that pause, so once C is ready we can continue B from where it left off. If C has a long prompt, though, processing it can create a longer gap between B’s output tokens.
 So when we call this continuous batching, we’re talking about the scheduler checking for freed slots between decode iterations and letting waiting requests enter before the whole previous group has finished. Prefill and decode still run one after another in this implementation, and getting them to overlap is something we can work on separately later.
 
-Paged KV Cache
+Paged KV Cache & Attention
 Up until this point each sequence had its own kv cache allocation with room for all 2048 possible token positions, which made appending the next token pretty straightforward because we already knew where to put its kv. However we were deciding how much memory belonged to the sequence before knowing how much it would actually need. For our model, one processed token needs 32 KiB of KV storage across all 16 layers, so each sequence’s allocation was:
 
 2048 positions × 32 KiB = 64 MiB
@@ -1057,6 +1090,7 @@ The block table for req A would then say layer 0: [5, 1, 7]. So essentially we�
 Now suppose request B has processed 20 tokens. It would need two pages for this layer, and we give it different slots, say, layer 0: [2, 6]
 So from our shared pool of say from slots 0 - 8, we can see how the requests KV cache data is not contiguous within VRAM, rather one pool of memory for all kv cache data is paged. Their block tables keep the histories separate and ordered
 To nail home the concept of growing into the space, lets look at slot 7, it has 2 processed tokens and so if we look back at how a slot is partitioned we have equal space for key and value vector. Thus 2 for key, and 2 for value in our case. Each K or V box represents a whole 512-value vector. The page has space for 16 key vectors and 16 matching value vectors, even though only two positions currently contain valid history.
+
 Those remaining positions stay available for A to grow into. B can receive another free page, but it can’t borrow individual unused positions inside A’s page.
 This is also why we track A’s cache length as 34. Three pages provide capacity for 48 positions, but attention should only read the 34 positions we’ve actually processed.
 This example though was only layer 0. Layer 1 produces its own KV, so A has a whole other set of mappings for that layer, and we repeat that across all 16 layers. The shared pool holds the actual vectors and each sequence’s block table records where its pieces live.
@@ -1086,3 +1120,6 @@ Now that we’ve processed all three positions, we divide the weighted-value sum
 attention output ≈ 38.40 / 1.736 ≈ 22.12
 That division is what normalizes the weights, so the result is a weighted average of our values. We’ve kept track of the total weight and the weighted contributions as we go, with the running maximum letting us keep those calculations numerically stable.
 And this carries straight across our page boundaries too, so when we finish reading physical page 5 and follow the block table to physical page 1, we keep the same running maximum, denominator and weighted-value sum, then continue updating them as we read the next positions. Moving to another page changes where we read the keys and values from, while those totals keep accumulating until we’ve processed the query’s entire valid history.
+
+Conclusion:
+Thank you so much for going through this journey with me and reading everything that's spilled out of my brain about the basics of inference. My hope is that you take it from here and strive to learn even more and apply the knowledge and problem solving you learned here to become a better engineer. I hope this wasn’t too hard to read ;).
